@@ -1,0 +1,17 @@
+# 打包产物（main.js 是构建产物，但刻意入库 —— 这个仓库的主交付物就是它）
+dist/
+
+# 依赖
+node_modules/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python 参考实现（只在本地生成测试向量用，不入库）
+__pycache__/
+*.pyc
+.venv/
+venv/

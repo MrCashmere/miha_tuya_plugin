@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# 二进制，别让 git 动它们
+*.zip   binary
+*.png   binary

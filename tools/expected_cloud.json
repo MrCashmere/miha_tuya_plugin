@@ -1,0 +1,68 @@
+{
+  "token_no_auth": {
+    "method": "GET",
+    "path": "/v1.0/token",
+    "query": {
+      "grant_type": 1
+    },
+    "bodyJson": "",
+    "useToken": false,
+    "sign": "715F7A8593B5E180A65B061FB299344856DF48746B40C73365C3022E8E2DDC14",
+    "t": 1700000000000
+  },
+  "devices_list": {
+    "method": "GET",
+    "path": "/v1.0/devices",
+    "query": {},
+    "bodyJson": "",
+    "useToken": true,
+    "sign": "D6F55F22DECE2DE073CFE62682E07B212D37D656BEA51BB2B3809F3F0878EC8F",
+    "t": 1700000000000
+  },
+  "paged_devices": {
+    "method": "GET",
+    "path": "/v1.0/iot-03/devices",
+    "query": {
+      "page_size": 100,
+      "page_no": 1
+    },
+    "bodyJson": "",
+    "useToken": true,
+    "sign": "78355C03455CEA6C21465A096848C63ABF03C727B476E9BED8ADB486FC08EE61",
+    "t": 1700000000000
+  },
+  "device_detail": {
+    "method": "GET",
+    "path": "/v1.0/devices/bf1234567890abcdefghij",
+    "query": {},
+    "bodyJson": "",
+    "useToken": true,
+    "sign": "041CA9894E2DC966557FD69ED0653ED503B9560630B9E3D693FEFF5A5771936E",
+    "t": 1700000000000
+  },
+  "spec": {
+    "method": "GET",
+    "path": "/v1.0/iot-03/devices/bf1234567890abcdefghij/specification",
+    "query": {},
+    "bodyJson": "",
+    "useToken": true,
+    "sign": "D78CCD4EB586FFB6FCE31B8C5402EB3CE0DCDA92473D847BFBDCF7132711BC54",
+    "t": 1700000000000
+  },
+  "commands": {
+    "method": "POST",
+    "path": "/v1.0/iot-03/devices/bf1234567890abcdefghij/commands",
+    "query": {},
+    "bodyJson": "{\"commands\":[{\"code\":\"switch_1\",\"value\":true}]}",
+    "useToken": true,
+    "sign": "66DFE0435FFEA7E02E666057781AF70C166AAD7BEE5F892663AD149024F1C4DB",
+    "t": 1700000000000
+  },
+  "_meta": {
+    "accessId": "testaccessid123456",
+    "accessSecret": "testsecretabcdefghijklmnopqrstuvwxyz",
+    "accessToken": "testtoken0123456789abcdef",
+    "endpoint": "https://openapi.tuyacn.com",
+    "fixedTimeMs": "1700000000000"
+  }
+}

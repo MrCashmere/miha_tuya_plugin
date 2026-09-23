@@ -1,0 +1,80 @@
+{
+  "v31_control": {
+    "version": 3.1,
+    "cmd": 7,
+    "payloadJson": "{\"devId\":\"bf1234\",\"uid\":\"bf1234\",\"t\":\"1700000000\",\"dps\":{\"1\":true}}",
+    "useSessionKey": false,
+    "frameHex": "000055aa000000010000000700000087332e3136346666653838303436643630653230316c4c355575565958547347572f422b486d34415263334d4b47624178666f69583235627976566d52497a355a46776c7476714b6d2f766b486b335530664d7749535868684776552b4354527375526f776a6d535a6a4744625953394b4d744c494747657545694379696f3dba8e8ddb0000aa55"
+  },
+  "v33_dpquery": {
+    "version": 3.3,
+    "cmd": 10,
+    "payloadJson": "{\"gwId\":\"bf1234\",\"devId\":\"bf1234\",\"uid\":\"bf1234\",\"t\":\"1700000000\"}",
+    "useSessionKey": false,
+    "frameHex": "000055aa000000010000000a000000587e29113a450e210dbe47951b3319cfcfa4e9f6f73049d772595baedbc3bc3a8ecdcc2866c0c5fa225f6e5bcaf566448cf9645c25b6fa8a9bfbe41e4dd4d1f3300efea48a0091daa595a3a780fe13bd0e7c5da7b20000aa55"
+  },
+  "v33_control": {
+    "version": 3.3,
+    "cmd": 7,
+    "payloadJson": "{\"devId\":\"bf1234\",\"uid\":\"bf1234\",\"t\":\"1700000000\",\"dps\":{\"1\":true,\"2\":100}}",
+    "useSessionKey": false,
+    "frameHex": "000055aa000000010000000700000067332e33000000000000000000000000d652f952e5585d3b065bf07e1e6e0045cdcc2866c0c5fa225f6e5bcaf566448cf9645c25b6fa8a9bfbe41e4dd4d1f3302125e1846bd4f824d1b2e468c2399266a9f750957089d64f19af73884d3b60f79acf5ea70000aa55"
+  },
+  "v33_heartbeat": {
+    "version": 3.3,
+    "cmd": 9,
+    "payloadJson": "{\"gwId\":\"bf1234\",\"devId\":\"bf1234\"}",
+    "useSessionKey": false,
+    "frameHex": "000055aa0000000100000009000000387e29113a450e210dbe47951b3319cfcfa4e9f6f73049d772595baedbc3bc3a8e0efea48a0091daa595a3a780fe13bd0e67f5a4f60000aa55"
+  },
+  "v34_dpquery_new": {
+    "version": 3.4,
+    "cmd": 16,
+    "payloadJson": "{}",
+    "useSessionKey": true,
+    "frameHex": "000055aa000000010000001000000034b7dadf8fb2a094e0cb3c1f1caaf99adeea04a615d2856765e199c83dde62772eec2e12a1fedeb15b5b4d9793e9698fa30000aa55"
+  },
+  "v34_control_new": {
+    "version": 3.4,
+    "cmd": 13,
+    "payloadJson": "{\"protocol\":5,\"t\":1700000000,\"data\":{\"dps\":{\"1\":true}}}",
+    "useSessionKey": true,
+    "frameHex": "000055aa000000010000000d000000746a2f4275da435008b5b5d1f2e19bf95d9fabc506b104548101bafb6638e0886b1e4c9dd4fafe30e6932f5acf9b6f4646472563a0fe8ddb6914321529740d6ae08e7ce1dafdf623cb20c0a8df8172887a664cfad76a3b4fe7bd9c1748325fc8a7f961a00cd0a20dfa6254e388547a8d410000aa55"
+  },
+  "v35_dpquery_new": {
+    "version": 3.5,
+    "cmd": 16,
+    "payloadJson": "{}",
+    "useSessionKey": true,
+    "frameHex": "00006699000000000001000000100000001e303132333435363738396162c9048485ede3243ab70ecb63d8cafca083da00009966"
+  },
+  "v35_control_new": {
+    "version": 3.5,
+    "cmd": 13,
+    "payloadJson": "{\"protocol\":5,\"t\":1700000000,\"data\":{\"dps\":{\"1\":true}}}",
+    "useSessionKey": true,
+    "frameHex": "000066990000000000010000000d00000062303132333435363738396162815793229b4d663c1e26091ec375accb31d593f1cfc41eff3c7f1388ff7b639708337c1c095d1b4c7068e7c46967721d48dee67c4a726d988f04a5d48670fc218b6c9af796f1fcc1d9f2bfc0385073ca9ba911f8a92f00009966"
+  },
+  "v35_heartbeat": {
+    "version": 3.5,
+    "cmd": 9,
+    "payloadJson": "{\"gwId\":\"bf1234\",\"devId\":\"bf1234\"}",
+    "useSessionKey": true,
+    "frameHex": "00006699000000000001000000090000003e303132333435363738396162c95bc155d22944063c446f2ff14698923f8785fbcde219b26a7f4bdbe26b2481107f4c45402ec4eaefcceae9223c2fa8d80e00009966"
+  },
+  "_meta": {
+    "key": "0123456789abcdef",
+    "sessionKeyHex": "66656463626139383736353433323130",
+    "devId": "bf1234567890abcdefghij",
+    "gcmFixedIvHex": "303132333435363738396162"
+  },
+  "_derivations": {
+    "localNonceHex": "000102030405060708090a0b0c0d0e0f",
+    "remoteNonceHex": "101112131415161718191a1b1c1d1e1f",
+    "xorHex": "10101010101010101010101010101010",
+    "sessionKey34Hex": "377222e061a924c591cd9c27ea163ed4",
+    "sessionKey35Hex": "ed2fd40d0e642b26f836170ad08ba03d",
+    "udpProbePlain": "{\"from\": \"app\", \"ip\": \"192.168.1.100\"}",
+    "udpProbeFrameHex": "0000669900000000000000000025000000423031323334353637383961627f0e835e0dc9a2e1b1a68b022089f5223d6e8436b8a89f183d41afa162fc03de170bd2a73c28f6a4a510c6475c9950dcda2369e5a37a00009966"
+  }
+}

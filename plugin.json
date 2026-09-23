@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "tuya-local",
+  "name": "涂鸦（局域网 + 云）",
+  "version": "1.0.0",
+  "runtime": "js",
+  "entry": "main.js",
+  "hostMinVersion": "2.0.0",
+  "description": "涂鸦设备的局域网直控实现（基于 Tuya Local 的协议移植）。填设备 ID + localKey + IP + 协议版本即可局域网直连；也可填涂鸦 IoT 平台的 Access ID / Access Secret，用云 OpenAPI 自动拉设备列表和 local_key，并把云通道作为兜底。设备能力描述由内置的「通用品类映射表」把涂鸦功能点（DP）翻译成 MIoT 的 siid/piid，认不出的功能点归入自定义服务，不丢控制。",
+  "author": "DeepSeek V4.1 Flash",
+  "homepage": "https://github.com/MrCashmere/miha_tuya_plugin",
+  "license": "MIT",
+  "permissions": [
+    "network",
+    "secureStore",
+    "crypto",
+    "log",
+    "lan"
+  ],
+  "login": {
+    "type": "form"
+  },
+  "capabilities": {
+    "homes": true,
+    "devices": true,
+    "scenes": false,
+    "spec": true,
+    "statistics": false,
+    "messages": false,
+    "consumables": false,
+    "lanControl": true,
+    "gatewayControl": false,
+    "gatewayAdmin": false,
+    "stream": false
+  },
+  "update": {
+    "source": "github",
+    "repo": "MrCashmere/miha_tuya_plugin",
+    "assetPattern": ".*\\.zip$"
+  }
+}

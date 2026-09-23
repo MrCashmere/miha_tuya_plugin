@@ -1,0 +1,22 @@
+{
+  "name": "miha-tuya-local-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "涂鸦（Tuya Local）设备的 miha（羊绒家居）插件。源代码按模块放在 src/，构建期拼接成宿主要求的单文件 main.js。",
+  "scripts": {
+    "build": "node tools/build.js",
+    "check": "node tools/build.js --check && node tools/package.js",
+    "test": "node tools/test_crypto.js && node tools/test_frames.js && node tools/test_cloud.js && node tools/test_mapping.js && node tools/test_plugin.js",
+    "test:mapping": "node tools/test_mapping.js",
+    "test:plugin": "node tools/test_plugin.js",
+    "gen:frames": "python tools/gen_expected_frames.py tools/expected_frames.json",
+    "gen:cloud": "python tools/gen_expected_cloud.py tools/expected_cloud.json",
+    "package": "node tools/build.js && node tools/package.js",
+    "release": "node tools/build.js && node tools/package.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrCashmere/miha_tuya_plugin"
+  }
+}
