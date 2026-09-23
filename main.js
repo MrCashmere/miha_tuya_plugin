@@ -6,9 +6,11 @@
  *
  * 拼接顺序（按文件名排序）：
  *   - 00-util.js
+ *   - 05-qr.js
  *   - 10-crypto.js
  *   - 20-lan.js
  *   - 30-cloud.js
+ *   - 35-mobile.js
  *   - 40-mapping.js
  *   - 50-plugin.js
  * ========================================================================== */
@@ -80,6 +82,618 @@ function safeLog(level, tag, msg) {
   } catch (e) {
     // 日志失败不影响业务
   }
+}
+
+/* ---------- 05-qr.js ---------------------------------------------------- */
+/* ============================================================================
+ * §0.5  二维码编码器（纯 JS：字节模式 / 纠错等级 M / 版本 1–10）
+ *
+ * ## 为什么这个插件里会有二维码编码器
+ *
+ * 涂鸦的扫码登录接口只返回一个 **token 字符串**，不返回图片：
+ *
+ *     POST apigw.iotbing.com/v1.0/m/life/home-assistant/qrcode/tokens?...  → {qrcode: "<token>"}
+ *
+ * 而宿主只接受 `imageUrl`（http(s) 地址或 `data:` URI），二维码得我们自己画。
+ *
+ * ⚠️ **绝不能图省事去调第三方在线二维码服务** —— 那等于把登录 token 送给外人。
+ *    自己编码是唯一安全的选择，代价就是下面这 400 行。
+ *
+ * ## 实现要点（ISO/IEC 18004）
+ *
+ *   - 字节模式（模式指示符 0100），字符计数 8 位（v1–9）/ 16 位（v10+）
+ *   - 纠错等级 M，版本按内容长度自适应
+ *   - Reed-Solomon 在 GF(256) 上，本原多项式 0x11D
+ *   - 8 种掩码全部评估，取罚分最低的（掩码选错有些老扫码器会读不出来）
+ *   - 输出 **1 位灰度 PNG**（每像素 1 bit），体积最小
+ *
+ * ## 怎么证明它是对的
+ *
+ * 不看"能不能扫出来"，而是**和参考实现逐模块比对**：
+ * Python 的 `qrcode` 库对同一段文本生成同版本的矩阵，两边 bit 逐一相等才算过。
+ * 见 `tools/gen_expected_qr.py` + `tools/test_qr.js`。
+ * ========================================================================== */
+
+/* ---------------------------------------------------------- GF(256) 与 RS */
+
+const QR_GF_EXP = new Uint8Array(512);
+const QR_GF_LOG = new Uint8Array(256);
+
+(function qrInitGf() {
+  let x = 1;
+  for (let i = 0; i < 255; i++) {
+    QR_GF_EXP[i] = x;
+    QR_GF_LOG[x] = i;
+    x <<= 1;
+    if (x & 0x100) x ^= 0x11d; // 本原多项式 x^8+x^4+x^3+x^2+1
+  }
+  for (let i = 255; i < 512; i++) QR_GF_EXP[i] = QR_GF_EXP[i - 255];
+})();
+
+function qrGfMul(a, b) {
+  if (a === 0 || b === 0) return 0;
+  return QR_GF_EXP[QR_GF_LOG[a] + QR_GF_LOG[b]];
+}
+
+/** 生成多项式 ∏(x - α^i)，系数按降幂排列，长度 n+1。 */
+function qrGenPoly(n) {
+  let poly = [1];
+  for (let i = 0; i < n; i++) {
+    const next = new Array(poly.length + 1).fill(0);
+    for (let j = 0; j < poly.length; j++) {
+      next[j] ^= poly[j];
+      next[j + 1] ^= qrGfMul(poly[j], QR_GF_EXP[i]);
+    }
+    poly = next;
+  }
+  return poly;
+}
+
+/** 对 data 求 ecLen 个纠错码字（综合除法取余）。 */
+function qrRsEncode(data, ecLen) {
+  const gen = qrGenPoly(ecLen);
+  const buf = new Uint8Array(data.length + ecLen);
+  buf.set(data);
+  for (let i = 0; i < data.length; i++) {
+    const coef = buf[i];
+    if (coef === 0) continue;
+    for (let j = 1; j < gen.length; j++) {
+      buf[i + j] ^= qrGfMul(gen[j], coef);
+    }
+  }
+  return buf.subarray(data.length);
+}
+
+/* ------------------------------------------------------------------ 表 */
+
+/*
+ * 纠错分块表：等级 → 版本 → 每块纠错码字数 + 两组（块数, 每块数据码字数）。
+ * 数据码字总数 = g1[0]*g1[1] + g2[0]*g2[1]。
+ *
+ * 只列 M 和 Q 两级 —— 够用，而且每一级都有对照向量验过。
+ * M 是通行默认；Q 用在扫码登录上（那个二维码要被人拿手机拍屏幕，
+ * 反光和摩尔纹是常态，HA 主线选的就是 QUARTILE）。
+ */
+const QR_EC = {
+  M: {
+    1: { ec: 10, g1: [1, 16], g2: [0, 0] },
+    2: { ec: 16, g1: [1, 28], g2: [0, 0] },
+    3: { ec: 26, g1: [1, 44], g2: [0, 0] },
+    4: { ec: 18, g1: [2, 32], g2: [0, 0] },
+    5: { ec: 24, g1: [2, 43], g2: [0, 0] },
+    6: { ec: 16, g1: [4, 27], g2: [0, 0] },
+    7: { ec: 18, g1: [4, 31], g2: [0, 0] },
+    8: { ec: 22, g1: [2, 38], g2: [2, 39] },
+    9: { ec: 22, g1: [3, 36], g2: [2, 37] },
+    10: { ec: 26, g1: [4, 43], g2: [1, 44] }
+  },
+  Q: {
+    1: { ec: 13, g1: [1, 13], g2: [0, 0] },
+    2: { ec: 22, g1: [1, 22], g2: [0, 0] },
+    3: { ec: 18, g1: [2, 17], g2: [0, 0] },
+    4: { ec: 26, g1: [2, 24], g2: [0, 0] },
+    5: { ec: 18, g1: [2, 15], g2: [2, 16] },
+    6: { ec: 24, g1: [4, 19], g2: [0, 0] },
+    7: { ec: 18, g1: [2, 14], g2: [4, 15] },
+    8: { ec: 22, g1: [4, 18], g2: [2, 19] },
+    9: { ec: 20, g1: [4, 16], g2: [4, 17] },
+    10: { ec: 24, g1: [6, 19], g2: [2, 20] }
+  }
+};
+
+/** 纠错等级的 2 位指示符。 */
+const QR_EC_INDICATOR = { L: 1, M: 0, Q: 3, H: 2 };
+
+function qrLevel(level) {
+  const key = String(level || 'M').trim().toUpperCase();
+  return QR_EC[key] ? key : 'M';
+}
+
+const QR_ALIGN = {
+  1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+  6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]
+};
+
+/** v7+ 的版本信息（18 位 BCH），直接查表比现算省事。 */
+const QR_VERSION_INFO = {
+  7: 0x07c94, 8: 0x085bc, 9: 0x09a99, 10: 0x0a4d3
+};
+
+/* ------------------------------------------------------------ 数据编码 */
+
+function qrDataCodewords(version, level) {
+  const t = QR_EC[level][version];
+  return t.g1[0] * t.g1[1] + t.g2[0] * t.g2[1];
+}
+
+function qrCountBits(version) {
+  return version <= 9 ? 8 : 16;
+}
+
+/** 选最小的、装得下的版本。装不下就抛错（别默默截断）。 */
+function qrPickVersion(byteLen, level) {
+  for (let v = 1; v <= 10; v++) {
+    const capacityBits = qrDataCodewords(v, level) * 8;
+    const needBits = 4 + qrCountBits(v) + byteLen * 8;
+    if (needBits <= capacityBits) return v;
+  }
+  throw new Error(
+    '二维码内容太长（' + byteLen + ' 字节，纠错等级 ' + level + '），超出本编码器的版本 10 上限'
+  );
+}
+
+/** 编码成最终的码字序列（含分块 + RS + 交织）。 */
+function qrCodewords(bytes, version, level) {
+  const total = qrDataCodewords(version, level);
+  const bits = [];
+  function push(value, len) {
+    for (let i = len - 1; i >= 0; i--) bits.push((value >> i) & 1);
+  }
+
+  push(0x4, 4);                       // 字节模式
+  push(bytes.length, qrCountBits(version));
+  for (let i = 0; i < bytes.length; i++) push(bytes[i], 8);
+
+  // 结束符：最多 4 个 0
+  const cap = total * 8;
+  for (let i = 0; i < 4 && bits.length < cap; i++) bits.push(0);
+  // 补齐到字节边界
+  while (bits.length % 8 !== 0) bits.push(0);
+
+  const data = new Uint8Array(total);
+  for (let i = 0; i < bits.length; i += 8) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) b = (b << 1) | bits[i + k];
+    data[i >> 3] = b;
+  }
+  // 交替填充字节
+  for (let i = bits.length >> 3, alt = 0; i < total; i++, alt++) {
+    data[i] = alt % 2 === 0 ? 0xec : 0x11;
+  }
+
+  // 分块
+  const t = QR_EC[level][version];
+  const blocks = [];
+  let off = 0;
+  for (let i = 0; i < t.g1[0]; i++) {
+    blocks.push({ data: data.subarray(off, off + t.g1[1]), ec: null });
+    off += t.g1[1];
+  }
+  for (let i = 0; i < t.g2[0]; i++) {
+    blocks.push({ data: data.subarray(off, off + t.g2[1]), ec: null });
+    off += t.g2[1];
+  }
+  for (let i = 0; i < blocks.length; i++) {
+    blocks[i].ec = qrRsEncode(blocks[i].data, t.ec);
+  }
+
+  // 交织：先按列取数据码字，再按列取纠错码字
+  const out = new Uint8Array(total + blocks.length * t.ec);
+  let p = 0;
+  const maxData = Math.max.apply(null, blocks.map(function (b) { return b.data.length; }));
+  for (let i = 0; i < maxData; i++) {
+    for (let b = 0; b < blocks.length; b++) {
+      if (i < blocks[b].data.length) out[p++] = blocks[b].data[i];
+    }
+  }
+  for (let i = 0; i < t.ec; i++) {
+    for (let b = 0; b < blocks.length; b++) out[p++] = blocks[b].ec[i];
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------- 矩阵构建 */
+
+function qrPlaceFinder(m, isFn, row, col, n) {
+  for (let dr = -1; dr <= 7; dr++) {
+    for (let dc = -1; dc <= 7; dc++) {
+      const r = row + dr;
+      const c = col + dc;
+      if (r < 0 || r >= n || c < 0 || c >= n) continue;
+      isFn[r][c] = true;
+      const inRing = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6;
+      let v = 0;
+      if (inRing) {
+        const edge = dr === 0 || dr === 6 || dc === 0 || dc === 6;
+        const core = dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4;
+        v = edge || core ? 1 : 0;
+      }
+      m[r][c] = v;
+    }
+  }
+}
+
+function qrPlaceAlignment(m, isFn, version, n) {
+  const centers = QR_ALIGN[version] || [];
+  const last = centers.length - 1;
+  for (let a = 0; a < centers.length; a++) {
+    for (let b = 0; b < centers.length; b++) {
+      const cr = centers[a];
+      const cc = centers[b];
+      // 与三个定位图形重叠的角不画
+      if ((a === 0 && b === 0) || (a === 0 && b === last) || (a === last && b === 0)) continue;
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          const r = cr + dr;
+          const c = cc + dc;
+          isFn[r][c] = true;
+          m[r][c] = (Math.abs(dr) === 2 || Math.abs(dc) === 2 || (dr === 0 && dc === 0)) ? 1 : 0;
+        }
+      }
+    }
+  }
+}
+
+function qrFormatBits(mask, level) {
+  const data = (QR_EC_INDICATOR[level] << 3) | mask; // 5 位
+  let d = data << 10;
+  for (let i = 14; i >= 10; i--) {
+    if ((d >> i) & 1) d ^= 0x537 << (i - 10);
+  }
+  return (((data << 10) | d) ^ 0x5412) & 0x7fff;
+}
+
+function qrMaskBit(mask, i, j) {
+  switch (mask) {
+    case 0: return (i + j) % 2 === 0;
+    case 1: return i % 2 === 0;
+    case 2: return j % 3 === 0;
+    case 3: return (i + j) % 3 === 0;
+    case 4: return (Math.floor(i / 2) + Math.floor(j / 3)) % 2 === 0;
+    case 5: return ((i * j) % 2) + ((i * j) % 3) === 0;
+    case 6: return (((i * j) % 2) + ((i * j) % 3)) % 2 === 0;
+    default: return (((i + j) % 2) + ((i * j) % 3)) % 2 === 0;
+  }
+}
+
+/**
+ * 按指定掩码生成完整矩阵。
+ * 0 = 浅色，1 = 深色。
+ */
+function qrComposeMatrix(version, codewords, mask, level) {
+  const n = version * 4 + 17;
+  const m = [];
+  const isFn = [];
+  for (let i = 0; i < n; i++) {
+    m.push(new Array(n).fill(0));
+    isFn.push(new Array(n).fill(false));
+  }
+
+  qrPlaceFinder(m, isFn, 0, 0, n);
+  qrPlaceFinder(m, isFn, n - 7, 0, n);
+  qrPlaceFinder(m, isFn, 0, n - 7, n);
+
+  // 定时图形
+  for (let c = 8; c < n - 8; c++) {
+    if (!isFn[6][c]) { isFn[6][c] = true; m[6][c] = c % 2 === 0 ? 1 : 0; }
+  }
+  for (let r = 8; r < n - 8; r++) {
+    if (!isFn[r][6]) { isFn[r][6] = true; m[r][6] = r % 2 === 0 ? 1 : 0; }
+  }
+
+  qrPlaceAlignment(m, isFn, version, n);
+
+  // 预留格式信息区（先占位，最后再写值）
+  for (let c = 0; c <= 8; c++) if (!isFn[8][c]) isFn[8][c] = true;
+  for (let r = 0; r <= 8; r++) if (!isFn[r][8]) isFn[r][8] = true;
+  for (let c = n - 8; c < n; c++) if (!isFn[8][c]) isFn[8][c] = true;
+  for (let r = n - 7; r < n; r++) if (!isFn[r][8]) isFn[r][8] = true;
+  isFn[n - 8][8] = true; // 固定深色模块
+
+  if (version >= 7) {
+    for (let r = 0; r < 6; r++) {
+      for (let c = n - 11; c <= n - 9; c++) isFn[r][c] = true;
+    }
+    for (let r = n - 11; r <= n - 9; r++) {
+      for (let c = 0; c < 6; c++) isFn[r][c] = true;
+    }
+  }
+
+  // ---- 数据按之字形填入 ----
+  const totalBits = codewords.length * 8;
+  let bitIndex = 0;
+  let upward = true;
+  for (let col = n - 1; col > 0; col -= 2) {
+    if (col === 6) col = 5; // 跳过定时列
+    for (let k = 0; k < n; k++) {
+      const row = upward ? n - 1 - k : k;
+      for (let c = 0; c < 2; c++) {
+        const cc = col - c;
+        if (isFn[row][cc]) continue;
+        let bit = 0;
+        if (bitIndex < totalBits) {
+          bit = (codewords[bitIndex >> 3] >> (7 - (bitIndex & 7))) & 1;
+        }
+        bitIndex++;
+        if (qrMaskBit(mask, row, cc)) bit ^= 1;
+        m[row][cc] = bit;
+      }
+    }
+    upward = !upward;
+  }
+
+  // ---- 格式信息 ----
+  //
+  // ⚠️ 布局极易写转置：这里 setFunctionModule 的语义是 (列, 行)，不是 (行, 列)。
+  //    第一份横竖各一段（绕着左上定位图形），第二份分给另外两个角。
+  //    写反了不会报错，只是**所有**版本、**所有**掩码都差那么几个模块。
+  const fmt = qrFormatBits(mask, level);
+  for (let i = 0; i <= 5; i++) m[i][8] = (fmt >> i) & 1;      // 列 8，行 0..5
+  m[7][8] = (fmt >> 6) & 1;
+  m[8][8] = (fmt >> 7) & 1;
+  m[8][7] = (fmt >> 8) & 1;
+  for (let i = 9; i <= 14; i++) m[8][14 - i] = (fmt >> i) & 1; // 行 8，列 5..0
+  for (let i = 0; i <= 7; i++) m[8][n - 1 - i] = (fmt >> i) & 1;   // 行 8，列 n-1..n-8
+  for (let i = 8; i <= 14; i++) m[n - 15 + i][8] = (fmt >> i) & 1; // 列 8，行 n-7..n-1
+
+  // ---- 固定深色模块 ----
+  m[n - 8][8] = 1;
+
+  // ---- 版本信息（v7+） ----
+  if (version >= 7) {
+    const vi = QR_VERSION_INFO[version];
+    for (let i = 0; i < 18; i++) {
+      const bit = (vi >> i) & 1;
+      const r = Math.floor(i / 3);
+      const c = i % 3;
+      m[n - 11 + c][r] = bit;
+      m[r][n - 11 + c] = bit;
+    }
+  }
+
+  return m;
+}
+
+/** 掩码罚分（4 条规则）。分数越低越好。 */
+function qrPenalty(m) {
+  const n = m.length;
+  let score = 0;
+
+  // 规则 1：行 / 列上连续同色 ≥5
+  for (let i = 0; i < n; i++) {
+    let rowRun = 1;
+    let colRun = 1;
+    for (let j = 1; j < n; j++) {
+      if (m[i][j] === m[i][j - 1]) rowRun++;
+      else { if (rowRun >= 5) score += 3 + (rowRun - 5); rowRun = 1; }
+      if (m[j][i] === m[j - 1][i]) colRun++;
+      else { if (colRun >= 5) score += 3 + (colRun - 5); colRun = 1; }
+    }
+    if (rowRun >= 5) score += 3 + (rowRun - 5);
+    if (colRun >= 5) score += 3 + (colRun - 5);
+  }
+
+  // 规则 2：2×2 同色块
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = 0; j < n - 1; j++) {
+      const v = m[i][j];
+      if (v === m[i][j + 1] && v === m[i + 1][j] && v === m[i + 1][j + 1]) score += 3;
+    }
+  }
+
+  // 规则 3：形似定位图形的 1:1:3:1:1 模式
+  const patA = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+  const patB = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+  function hit(get, start, pat) {
+    for (let k = 0; k < 11; k++) if (get(start + k) !== pat[k]) return false;
+    return true;
+  }
+  for (let i = 0; i < n; i++) {
+    const rowGet = function (c) { return m[i][c]; };
+    const colGet = function (r) { return m[r][i]; };
+    for (let j = 0; j + 11 <= n; j++) {
+      if (hit(rowGet, j, patA) || hit(rowGet, j, patB)) score += 40;
+      if (hit(colGet, j, patA) || hit(colGet, j, patB)) score += 40;
+    }
+  }
+
+  // 规则 4：深色比例偏离 50%
+  let dark = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) if (m[i][j]) dark++;
+  }
+  const pct = (dark * 100) / (n * n);
+  score += 10 * Math.floor(Math.abs(pct - 50) / 5);
+
+  return score;
+}
+
+/* ---------------------------------------------------------------- PNG */
+
+function qrAdler32(bytes) {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    a = (a + bytes[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/** zlib 包装：只用 stored（不压缩）块 —— 不需要实现 deflate，产物确定。 */
+function qrZlibStored(raw) {
+  const MAX = 65535;
+  const parts = [];
+  let off = 0;
+  do {
+    const len = Math.min(MAX, raw.length - off);
+    const last = off + len >= raw.length ? 1 : 0;
+    const head = new Uint8Array(5);
+    head[0] = last;
+    head[1] = len & 0xff;
+    head[2] = (len >> 8) & 0xff;
+    head[3] = (~len) & 0xff;
+    head[4] = ((~len) >> 8) & 0xff;
+    parts.push(head);
+    if (len > 0) parts.push(raw.subarray(off, off + len));
+    off += len;
+  } while (off < raw.length);
+
+  let size = 2 + 4;
+  for (let i = 0; i < parts.length; i++) size += parts[i].length;
+
+  const out = new Uint8Array(size);
+  out[0] = 0x78;
+  out[1] = 0x01;
+  let p = 2;
+  for (let i = 0; i < parts.length; i++) {
+    out.set(parts[i], p);
+    p += parts[i].length;
+  }
+  const ad = qrAdler32(raw);
+  out[p] = (ad >>> 24) & 0xff;
+  out[p + 1] = (ad >>> 16) & 0xff;
+  out[p + 2] = (ad >>> 8) & 0xff;
+  out[p + 3] = ad & 0xff;
+  return out;
+}
+
+function qrPngChunk(type, data) {
+  const len = data.length;
+  const out = new Uint8Array(12 + len);
+  out[0] = (len >>> 24) & 0xff;
+  out[1] = (len >>> 16) & 0xff;
+  out[2] = (len >>> 8) & 0xff;
+  out[3] = len & 0xff;
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  const c = crc32(out.subarray(4, 8 + len)) >>> 0;
+  out[8 + len] = (c >>> 24) & 0xff;
+  out[9 + len] = (c >>> 16) & 0xff;
+  out[10 + len] = (c >>> 8) & 0xff;
+  out[11 + len] = c & 0xff;
+  return out;
+}
+
+/** 把 0/1 矩阵渲染成 1 位灰度 PNG 的 data URI。 */
+function qrMatrixToPngDataUri(modules, scale, quiet) {
+  const n = modules.length;
+  const px = (n + quiet * 2) * scale;
+  const rowBytes = Math.ceil(px / 8);
+  const stride = rowBytes + 1; // 每行前面一个 filter 字节
+  const raw = new Uint8Array(stride * px);
+
+  // 底色全部填白（1 位 = 1）
+  for (let y = 0; y < px; y++) {
+    raw[y * stride] = 0; // filter: None
+    const base = y * stride + 1;
+    for (let b = 0; b < rowBytes; b++) raw[base + b] = 0xff;
+  }
+  // 深色模块画成黑（bit 0）
+  for (let my = 0; my < n; my++) {
+    for (let mx = 0; mx < n; mx++) {
+      if (!modules[my][mx]) continue;
+      const y0 = (my + quiet) * scale;
+      const x0 = (mx + quiet) * scale;
+      for (let dy = 0; dy < scale; dy++) {
+        const base = (y0 + dy) * stride + 1;
+        for (let dx = 0; dx < scale; dx++) {
+          const x = x0 + dx;
+          raw[base + (x >> 3)] &= ~(0x80 >> (x & 7)) & 0xff;
+        }
+      }
+    }
+  }
+
+  const ihdr = new Uint8Array(13);
+  ihdr[0] = (px >>> 24) & 0xff; ihdr[1] = (px >>> 16) & 0xff;
+  ihdr[2] = (px >>> 8) & 0xff; ihdr[3] = px & 0xff;
+  ihdr[4] = (px >>> 24) & 0xff; ihdr[5] = (px >>> 16) & 0xff;
+  ihdr[6] = (px >>> 8) & 0xff; ihdr[7] = px & 0xff;
+  ihdr[8] = 1;  // bit depth
+  ihdr[9] = 0;  // color type: 灰度
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const chunks = [
+    sig,
+    qrPngChunk('IHDR', ihdr),
+    qrPngChunk('IDAT', qrZlibStored(raw)),
+    qrPngChunk('IEND', new Uint8Array(0))
+  ];
+  let total = 0;
+  for (let i = 0; i < chunks.length; i++) total += chunks[i].length;
+  const png = new Uint8Array(total);
+  let p = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    png.set(chunks[i], p);
+    p += chunks[i].length;
+  }
+  return 'data:image/png;base64,' + bytesToB64(png);
+}
+
+/* -------------------------------------------------------------- 对外接口 */
+
+/**
+ * 生成二维码矩阵。
+ *
+ * `forceMask` 传 0–7 可指定掩码 —— 只为和参考实现逐模块比对时用，
+ * 正常调用不要传（让它自己选罚分最低的）。
+ * `level` 是纠错等级 'M' / 'Q'，默认 'M'。
+ */
+function qrEncodeMatrix(text, forceMask, level) {
+  const lv = qrLevel(level);
+  const bytes = utf8Bytes(String(text));
+  const version = qrPickVersion(bytes.length, lv);
+  const codewords = qrCodewords(bytes, version, lv);
+
+  if (forceMask !== undefined && forceMask !== null) {
+    return {
+      version: version,
+      level: lv,
+      size: version * 4 + 17,
+      mask: forceMask,
+      modules: qrComposeMatrix(version, codewords, forceMask, lv)
+    };
+  }
+
+  let best = null;
+  for (let mask = 0; mask < 8; mask++) {
+    const modules = qrComposeMatrix(version, codewords, mask, lv);
+    const score = qrPenalty(modules);
+    if (!best || score < best.score) best = { score: score, mask: mask, modules: modules };
+  }
+  return {
+    version: version,
+    level: lv,
+    size: version * 4 + 17,
+    mask: best.mask,
+    score: best.score,
+    modules: best.modules
+  };
+}
+
+/**
+ * 一段文本 → `data:image/png;base64,...`（可直接丢给宿主的 `imageUrl`）。
+ * 默认 4 像素/模块、静区 4 模块（标准要求）。
+ */
+function qrMakePngDataUri(text, scale, quiet, level) {
+  const s = numOr(scale, 4);
+  const q = quiet === undefined ? 4 : numOr(quiet, 4);
+  const r = qrEncodeMatrix(text, null, level);
+  return qrMatrixToPngDataUri(r.modules, s < 1 ? 1 : s, q < 0 ? 0 : q);
 }
 
 /* ---------- 10-crypto.js ------------------------------------------------ */
@@ -2143,6 +2757,541 @@ async function cloudSetDeviceStatus(auth, did, payload) {
   throw lastErr || new Error('云端下发失败');
 }
 
+/* ---------- 35-mobile.js ------------------------------------------------ */
+/* ============================================================================
+ * §8.5  涂鸦手机端云 API（扫码登录那条路）
+ *
+ * ## 为什么有两条云路径
+ *
+ * 涂鸦有两套完全不同的云接口：
+ *
+ *   | | 开放平台 OpenAPI（§8） | 手机端 App API（本文件） |
+ *   | --- | --- | --- |
+ *   | 凭据 | 开发者账号 accessId / accessSecret | **账号扫码登录** |
+ *   | 路径 | `/v1.0/iot-03/...` | `/v1.0/m/life/...`、`/v1.0/m/thing/...` |
+ *   | 限制 | 试用版 1 个月、最多 50 台、只能控制 10 台 | 无这些限制 |
+ *
+ * 开放平台那条**只给 1 个月试用**，过期后全部返回 28841002（订阅过期）。
+ * 而 `tuya-local` 与 HA 主线官方集成走的都是**扫码这条路**，所以它是主路径，
+ * 开放平台那条保留下来只为兼容旧配置。
+ *
+ * ## 从哪来的
+ *
+ * 对照 `tuya_sharing`（tuya-device-sharing-sdk）的 `user.py` / `customerapi.py`
+ * / `manager.py` / `device.py` / `home.py` 逐行移植。那个 SDK 是涂鸦官方维护、
+ * HA 主线在用的，`client_id` / `schema` 也是官方发给 HA 的，不是逆向出来的。
+ *
+ * ## 两条链路
+ *
+ *   ① **换二维码 / 轮询扫码结果**：`apigw.iotbing.com`，**完全不需要签名**
+ *   ② **业务接口**：登录结果里带回来的 `endpoint`，需要一套自成一体的签名
+ *
+ * ## 业务接口的签名（三步，对照 `customerapi.py` 的 `__request`）
+ *
+ *   hashKey = md5(rid + refresh_token)                      ← 十六进制
+ *   secret  = hmacSha256(key = rid, msg = hashKey).hex[:16] ← 十六进制前 16 位
+ *   X-sign  = hmacSha256(key = hashKey,
+ *                        msg = "X-appKey=..||X-requestId=..||X-time=.."
+ *                              + 加密后的 query + 加密后的 body)
+ *
+ * 载荷（query 参数 / body）用 `secret` 做 **AES-128-GCM**，nonce 12 字节：
+ *
+ *   密文串 = base64(nonce) + base64(ciphertext + tag)
+ *   query  → `{"encdata": 密文串}`（放到 query string 里）
+ *   body   → `{"encdata": 密文串}`
+ *
+ * 响应里的 `result` 用**同一个 secret** 解密后才是 JSON。
+ *
+ * ⚠️ 拼接 base64 而不是 base64(拼接)：12 字节的 base64 恰好 16 字符且无填充、
+ *    长度是 4 的倍数，所以整体解码后正好是 nonce + 密文 —— 这个"巧合"是协议
+ *    的一部分，照抄就好，别自作聪明改成 base64(nonce || ct)。
+ * ⚠️ 签名里 query / body 的密文串**不 URL 编码**（URL 里那份才编码）。
+ * ========================================================================== */
+
+/** 涂鸦官方发给 Home Assistant 的 client_id / schema（HA 主线用的就是这两个）。 */
+const MOBILE_APP_KEY = 'HA_3y9q4ak7g4ephrvke';
+const MOBILE_SCHEMA = 'haauthorize';
+
+/** 日志用的标签（不复用 50-plugin.js 的 TAG，避免拼接后名字撞车）。 */
+const TAG_MOBILE = 'tuya-cloud';
+
+/** 换二维码与轮询的固定入口（业务接口用登录返回的 endpoint）。 */
+const MOBILE_LOGIN_HOST = 'https://apigw.iotbing.com';
+
+/** 仅自检用：把 rid / nonce 固定下来，密文与签名才可复现。正常路径一律随机。 */
+let MOBILE_TEST_RID = null;
+let MOBILE_TEST_NONCE = null;
+
+function mobileSetTestVector(rid, nonce) {
+  MOBILE_TEST_RID = rid || null;
+  MOBILE_TEST_NONCE = nonce || null;
+}
+
+/* ------------------------------------------------------------ 小工具 */
+
+/**
+ * 协议里的 JSON 是紧凑的（Python 的 `separators=(",", ":")`）。
+ *
+ * ⚠️ 还要**把非 ASCII 转义成 `\uXXXX`** —— Python 的 `json.dumps` 默认
+ *    `ensure_ascii=True` 就是这么干的。功能上两种写法解析结果一样，但字节层面
+ *    不同，会让密文和签名对不上官方 SDK。要和参照实现逐字节对齐就得照做。
+ */
+function mobileCompactJson(obj) {
+  return JSON.stringify(obj).replace(/[\u0080-\uffff]/g, function (ch) {
+    return '\\u' + ('0000' + ch.charCodeAt(0).toString(16)).slice(-4);
+  });
+}
+
+/** nonce 用的字符表 —— 照抄 SDK 的 `_random_nonce`。 */
+const MOBILE_NONCE_ALPHABET = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';
+
+async function mobileRandomNonce(n) {
+  if (MOBILE_TEST_NONCE) return MOBILE_TEST_NONCE.substring(0, n);
+  const bytes = await randomBytesOrPseudoAsync(n);
+  let s = '';
+  for (let i = 0; i < n; i++) {
+    s += MOBILE_NONCE_ALPHABET.charAt(bytes[i] % MOBILE_NONCE_ALPHABET.length);
+  }
+  return s;
+}
+
+function mobileUuid() {
+  if (MOBILE_TEST_RID) return MOBILE_TEST_RID;
+  const b = pseudoRandomBytes(16);
+  b[6] = (b[6] & 0x0f) | 0x40; // version 4
+  b[8] = (b[8] & 0x3f) | 0x80; // variant
+  const hex = bytesToHex(b);
+  return hex.substring(0, 8) + '-' + hex.substring(8, 12) + '-' + hex.substring(12, 16)
+    + '-' + hex.substring(16, 20) + '-' + hex.substring(20, 32);
+}
+
+/* -------------------------------------------------------- 签名与加密 */
+
+/** `hashKey = md5(rid + refresh_token)`。 */
+function mobileHashKey(rid, refreshToken) {
+  return md5Hex(utf8Bytes(rid + String(refreshToken || '')));
+}
+
+/** `secret = hmacSha256(rid, hashKey).hex[:16]` —— 16 个 ASCII 字符，正好一个 AES-128 密钥。 */
+function mobileSecret(rid, hashKey) {
+  return bytesToHex(hmacSha256Bytes(utf8Bytes(rid), utf8Bytes(hashKey))).substring(0, 16);
+}
+
+/** 头部参与签名的字段与**固定顺序**。空值跳过，用 `||` 连接，末尾不带 `||`。 */
+const MOBILE_SIGN_HEADERS = ['X-appKey', 'X-requestId', 'X-sid', 'X-time', 'X-token'];
+
+function mobileSignStr(headers, queryEnc, bodyEnc) {
+  const parts = [];
+  for (let i = 0; i < MOBILE_SIGN_HEADERS.length; i++) {
+    const k = MOBILE_SIGN_HEADERS[i];
+    const v = headers[k];
+    if (v !== undefined && v !== null && String(v) !== '') {
+      parts.push(k + '=' + String(v));
+    }
+  }
+  // 注意：头部串与密文串之间**没有分隔符**，query 与 body 之间也没有
+  return parts.join('||') + (queryEnc || '') + (bodyEnc || '');
+}
+
+function mobileSign(hashKey, headers, queryEnc, bodyEnc) {
+  const str = mobileSignStr(headers, queryEnc, bodyEnc);
+  return bytesToHex(hmacSha256Bytes(utf8Bytes(hashKey), utf8Bytes(str)));
+}
+
+/** 明文 → 密文串（base64(nonce) + base64(ct+tag)）。 */
+async function mobileEncrypt(plainText, secret) {
+  const nonce = await mobileRandomNonce(12);
+  const r = aesGcmEncrypt(
+    utf8Bytes(secret),
+    latin1Bytes(nonce),
+    new Uint8Array(0),
+    utf8Bytes(plainText)
+  );
+  return bytesToB64(latin1Bytes(nonce)) + bytesToB64(bytesConcat([r.cipher, r.tag]));
+}
+
+/** 密文串 → 明文。解不开会抛错（密钥/结构不对时的唯一信号）。 */
+function mobileDecrypt(cipherText, secret) {
+  const all = b64ToBytes(String(cipherText));
+  if (all.length < 12 + 16) throw new Error('云端返回的密文长度不对');
+  const nonce = all.subarray(0, 12);
+  const rest = all.subarray(12);
+  const cipher = rest.subarray(0, rest.length - 16);
+  const tag = rest.subarray(rest.length - 16);
+  const plain = aesGcmDecrypt(utf8Bytes(secret), nonce, new Uint8Array(0), cipher, tag);
+  return bytesUtf8(plain);
+}
+
+/* ------------------------------------------------------------ 令牌 */
+
+/** 统一读 token 字段 —— 扫码结果用 snake_case，刷新的结果用 camelCase。 */
+function mobileReadTokenFields(result) {
+  if (!result || typeof result !== 'object') return null;
+  const accessToken = result.access_token || result.accessToken || '';
+  if (!accessToken) return null;
+  const expireSeconds = Number(result.expire_time || result.expireTime || 7200);
+  return {
+    accessToken: String(accessToken),
+    refreshToken: String(result.refresh_token || result.refreshToken || ''),
+    expireTime: Date.now() + (isFinite(expireSeconds) && expireSeconds > 0 ? expireSeconds : 7200) * 1000,
+    uid: String(result.uid || '')
+  };
+}
+
+/**
+ * 确保 access_token 可用（提前 60 秒刷新）。
+ * `_refreshing` 是重入闸门：刷新请求本身也要走 `mobileRequest`，
+ * 没有这个标记会无限递归（SDK 里的 `self.refresh_token` 是同一个作用）。
+ */
+async function mobileEnsureToken(auth) {
+  if (auth.accessToken && auth.expireTime && Date.now() < auth.expireTime - 60000) {
+    return auth;
+  }
+  if (!auth.refreshToken) {
+    throw new Error('涂鸦登录已失效，请重新扫码登录');
+  }
+  auth._refreshing = true;
+  try {
+    const result = await mobileRequest(auth, 'GET', '/v1.0/m/token/' + auth.refreshToken, null, null);
+    const f = mobileReadTokenFields(result);
+    if (!f) throw new Error('刷新令牌的返回里没有 accessToken');
+    auth.accessToken = f.accessToken;
+    if (f.refreshToken) auth.refreshToken = f.refreshToken;
+    auth.expireTime = f.expireTime;
+    if (f.uid) auth.uid = f.uid;
+  } finally {
+    auth._refreshing = false;
+  }
+  return auth;
+}
+
+/* ------------------------------------------------------------ 请求 */
+
+/**
+ * 发一次手机端业务请求，返回解密后的 `result`。
+ *
+ * ⚠️ 手机端接口的响应结构是 `{success, code, msg, result}`，且 **result 恒为密文**。
+ */
+async function mobileRequest(auth, method, path, params, body) {
+  if (!auth.endpoint) {
+    throw new Error('缺少云端接入点 endpoint，请重新扫码登录');
+  }
+  if (!auth._refreshing) {
+    await mobileEnsureToken(auth);
+  }
+
+  const rid = mobileUuid();
+  const sid = '';
+  const hashKey = mobileHashKey(rid, auth.refreshToken);
+  const secret = mobileSecret(rid, hashKey);
+
+  let queryEnc = '';
+  let hasQuery = false;
+  if (params && Object.keys(params).length > 0) {
+    queryEnc = await mobileEncrypt(mobileCompactJson(params), secret);
+    hasQuery = true;
+  }
+  let bodyEnc = '';
+  let bodyText = '';
+  if (body && Object.keys(body).length > 0) {
+    bodyEnc = await mobileEncrypt(mobileCompactJson(body), secret);
+    bodyText = mobileCompactJson({ encdata: bodyEnc });
+  }
+
+  const headers = {
+    'X-appKey': MOBILE_APP_KEY,
+    'X-requestId': rid,
+    'X-sid': sid,
+    'X-time': String(Date.now())
+  };
+  if (auth.accessToken) headers['X-token'] = auth.accessToken;
+  headers['X-sign'] = mobileSign(hashKey, headers, queryEnc, bodyEnc);
+
+  let url = auth.endpoint + path;
+  if (hasQuery) {
+    url += (path.indexOf('?') >= 0 ? '&' : '?') + 'encdata=' + encodeURIComponent(queryEnc);
+  }
+
+  const sendHeaders = Object.assign({ 'Content-Type': 'application/json' }, headers);
+  let res;
+  try {
+    if (method === 'GET' || method === 'DELETE') {
+      res = await Host.http(method, url, sendHeaders);
+    } else {
+      res = await Host.http(method, url, sendHeaders, bodyText);
+    }
+  } catch (e) {
+    throw new Error('云请求失败（' + method + ' ' + path + '）：' + describeError(e));
+  }
+
+  const parsed = mobileParseHttp(res, method, path);
+  if (parsed && parsed.success === false) {
+    const code = parsed.code;
+    const msg = parsed.msg || parsed.message || '未知错误';
+    const err = new Error('涂鸦云拒绝（code=' + code + '）：' + msg);
+    err.tuyaCode = code;
+    throw err;
+  }
+
+  const raw = parsed ? parsed.result : null;
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw !== 'string') return raw;
+
+  try {
+    const plain = mobileDecrypt(raw, secret);
+    try {
+      return JSON.parse(plain);
+    } catch (e) {
+      return plain; // 不是 JSON 就把明文原样给出
+    }
+  } catch (e) {
+    throw new Error('云端返回解密失败（' + describeError(e) + '）');
+  }
+}
+
+function mobileParseHttp(res, method, path) {
+  if (!res) throw new Error('云请求没有返回（' + method + ' ' + path + '）');
+  let parsed = null;
+  try {
+    parsed = JSON.parse(res.body);
+  } catch (e) {
+    throw new Error(
+      '云返回不是 JSON（HTTP ' + res.status + '）：' + String(res.body || '').substring(0, 120)
+    );
+  }
+  return parsed;
+}
+
+/* -------------------------------------------------------- 扫码登录 */
+
+/**
+ * 换一张二维码。
+ * 这一步**不需要签名**，是普通 HTTP —— 所以「扫码」这条路在纯 JS 里很轻。
+ */
+async function mobileQrCreate(userCode) {
+  const url = MOBILE_LOGIN_HOST + '/v1.0/m/life/home-assistant/qrcode/tokens'
+    + '?clientid=' + encodeURIComponent(MOBILE_APP_KEY)
+    + '&usercode=' + encodeURIComponent(userCode)
+    + '&schema=' + encodeURIComponent(MOBILE_SCHEMA);
+
+  let res;
+  try {
+    res = await Host.http('POST', url, { 'Content-Type': 'application/json' });
+  } catch (e) {
+    throw new Error('获取登录二维码失败（网络不通？）：' + describeError(e));
+  }
+  const parsed = mobileParseHttp(res, 'POST', '/v1.0/m/life/home-assistant/qrcode/tokens');
+  if (!parsed.success) {
+    throw new Error('获取登录二维码被拒绝（code=' + parsed.code + '）：' + (parsed.msg || '未知错误'));
+  }
+  const token = parsed.result && parsed.result.qrcode;
+  if (!token) throw new Error('登录二维码返回里没有 qrcode 字段');
+  return String(token);
+}
+
+/**
+ * 轮询扫码结果。
+ *
+ * ⚠️ **"还没扫"时接口返回 `success: false`，这不叫失败** —— 必须映射成
+ *    `{ ok: false }` 让上层返回 `pending`。抛错的话宿主连续 3 次就判登录失败、
+ *    把弹窗关掉，用户扫到一半就没了。
+ */
+async function mobileQrPoll(userCode, token) {
+  const url = MOBILE_LOGIN_HOST + '/v1.0/m/life/home-assistant/qrcode/tokens/'
+    + encodeURIComponent(token)
+    + '?clientid=' + encodeURIComponent(MOBILE_APP_KEY)
+    + '&usercode=' + encodeURIComponent(userCode);
+
+  const res = await Host.http('GET', url, {});
+  const parsed = mobileParseHttp(res, 'GET', '/qrcode/tokens/{token}');
+  if (!parsed.success) {
+    return { ok: false, code: parsed.code, msg: parsed.msg || parsed.message || '' };
+  }
+  return { ok: true, result: parsed.result || {}, t: parsed.t };
+}
+
+/** 把扫码结果里的登录信息落成我们的 auth 结构。 */
+function mobileAuthFromLogin(userCode, loginResult) {
+  const r = loginResult || {};
+  const endpoint = String(r.endpoint || '');
+  const terminalId = String(r.terminal_id || r.terminalId || '');
+  if (!endpoint) throw new Error('扫码结果里没有 endpoint，无法继续');
+  const auth = {
+    mode: 'account',
+    userCode: String(userCode || ''),
+    terminalId: terminalId,
+    endpoint: endpoint.replace(/\/+$/, ''),
+    accessToken: '',
+    refreshToken: '',
+    expireTime: 0,
+    uid: '',
+    manual: []
+  };
+  const f = mobileReadTokenFields(r);
+  if (!f) throw new Error('扫码结果里没有 access_token');
+  auth.accessToken = f.accessToken;
+  auth.refreshToken = f.refreshToken;
+  auth.expireTime = f.expireTime;
+  auth.uid = f.uid;
+  return auth;
+}
+
+/* ------------------------------------------------------ 数据面：家庭 */
+
+/** 家庭列表。SDK 拿 `ownerId` 当家庭 id。 */
+async function mobileGetHomes(auth) {
+  const result = await mobileRequest(auth, 'GET', '/v1.0/m/life/users/homes', null, null);
+  const out = [];
+  const list = asArray(result);
+  for (let i = 0; i < list.length; i++) {
+    const h = list[i] || {};
+    const id = String(h.ownerId || h.gid || h.id || '');
+    if (!id) continue;
+    out.push({ id: id, name: String(h.name || id) });
+  }
+  return out;
+}
+
+/** 某个家庭下的设备（含 local_key 与 ip —— 这是云端最值钱的两个字段）。 */
+async function mobileGetDevicesByHome(auth, homeId) {
+  const result = await mobileRequest(
+    auth, 'GET', '/v1.0/m/life/ha/home/devices', { homeId: String(homeId) }, null
+  );
+  return asArray(result);
+}
+
+/** 设备详情（按 id 批量）。MQ 掉线、缓存过期时补数据用。 */
+async function mobileGetDevicesByIds(auth, ids) {
+  if (!ids || ids.length === 0) return [];
+  const result = await mobileRequest(
+    auth, 'GET', '/v1.0/m/life/ha/devices/detail', { devIds: ids.join(',') }, null
+  );
+  return asArray(result);
+}
+
+/** 设备所在房间（一次一台设备）。 */
+async function mobileGetRoomByDevice(auth, did) {
+  const result = await mobileRequest(auth, 'GET', '/v1.0/m/thing/ha/' + did + '/room', null, null);
+  if (!result || typeof result !== 'object') return null;
+  const id = String(result.id || '');
+  if (!id) return null;
+  return {
+    id: id,
+    name: String(result.name || ''),
+    order: numOr(result.displayOrder, 0)
+  };
+}
+
+/* ------------------------------------------------ 数据面：功能点与规格 */
+
+/**
+ * 设备的 DP 关系表：`GET /v1.0/m/life/devices/{did}/status`。
+ *
+ * 返回的 `dpStatusRelationDTOS` 直接给出 **dpId ↔ statusCode(dpCode)** 的对应，
+ * 还带 `valueType` / `valueDesc` / `enumMappingMap` / `supportLocal`。
+ * 这比开放平台的 specification 接口强 —— 后者不一定给 dp_id，
+ * 而局域网读写恰恰需要 dp 编号。
+ */
+async function mobileGetDpRelations(auth, did) {
+  const result = await mobileRequest(auth, 'GET', '/v1.0/m/life/devices/' + did + '/status', null, null);
+  if (!result || typeof result !== 'object') return null;
+  const list = asArray(result.dpStatusRelationDTOS);
+  const byCode = {};
+  const byId = {};
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i] || {};
+    const code = String(it.statusCode || it.dpCode || '');
+    const dpId = (it.dpId === undefined || it.dpId === null) ? null : numOr(it.dpId, null);
+    if (!code && dpId === null) continue;
+    const rec = {
+      dpId: dpId,
+      code: code,
+      valueType: String(it.valueType || ''),
+      valueDesc: String(it.valueDesc || ''),
+      enumMappingMap: it.enumMappingMap || null,
+      supportLocal: it.supportLocal !== false
+    };
+    if (code) byCode[code] = rec;
+    if (dpId !== null) byId[String(dpId)] = rec;
+  }
+  return {
+    productKey: String(result.productKey || ''),
+    byCode: byCode,
+    byId: byId,
+    supportLocal: list.length > 0 && list.every(function (x) { return x && x.supportLocal !== false; })
+  };
+}
+
+/**
+ * 设备的规格（functions / status）。
+ *
+ * 把 `dpId` 从 DP 关系表合并进来 —— 这样映射层能同时拿到
+ * **语义化的 code** 和**局域网要用的 dp 编号**，是三条来源里最全的一份。
+ */
+async function mobileGetSpec(auth, did) {
+  const spec = await mobileRequest(auth, 'GET', '/v1.1/m/life/' + did + '/specifications', null, null);
+  if (!spec || typeof spec !== 'object') return null;
+
+  let relations = null;
+  try {
+    relations = await mobileGetDpRelations(auth, did);
+  } catch (e) {
+    safeLog('error', TAG_MOBILE, '取 DP 关系表失败 ' + did + '：' + describeError(e));
+  }
+
+  const out = { category: '', functions: [], status: [] };
+  const groups = ['functions', 'status'];
+  for (let g = 0; g < groups.length; g++) {
+    const arr = asArray(spec[groups[g]]);
+    for (let i = 0; i < arr.length; i++) {
+      const it = arr[i] || {};
+      const code = String(it.code || '');
+      if (!code) continue;
+      const rel = relations ? relations.byCode[code] : null;
+      out[groups[g]].push({
+        code: code,
+        type: it.type,
+        values: it.values,
+        // 关系表里有 dp 编号就带上；没有就留空，让映射层退回"按 code 认"
+        dp_id: rel && rel.dpId !== null ? rel.dpId : undefined
+      });
+    }
+  }
+  if (out.functions.length === 0 && out.status.length === 0) return null;
+  return out;
+}
+
+/* ------------------------------------------------ 数据面：状态与下发 */
+
+/**
+ * 读设备当前状态。
+ * `support_local` 为 false 的设备用 code 上报（`[{code, value}]`），
+ * 其余用 dpId（`[{dpId, value}]`）—— 两种都归一成 `code` 或 `dp:<id>` 做键。
+ */
+function mobileNormalizeStatus(rawList, relations) {
+  const out = {};
+  const list = asArray(rawList);
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i] || {};
+    if (it.value === undefined) continue;
+    if (it.code !== undefined) {
+      out[String(it.code)] = it.value;
+    } else if (it.dpId !== undefined) {
+      const rel = relations ? relations.byId[String(it.dpId)] : null;
+      if (rel && rel.code) out[rel.code] = it.value;
+      else out[String(it.dpId)] = it.value;
+    }
+  }
+  return out;
+}
+
+/** 云端下发一组命令（DP code → value）。设备列表接口里也带了一次 status。 */
+async function mobileSendCommands(auth, did, commands) {
+  return mobileRequest(
+    auth, 'POST', '/v1.1/m/thing/' + did + '/commands', null, { commands: commands }
+  );
+}
+
 /* ---------- 40-mapping.js ----------------------------------------------- */
 /* ============================================================================
  * §9  Tuya DP ⇄ MIoT 能力描述映射
@@ -3411,11 +4560,22 @@ function isEntryAddressable(entry, version) {
  *
  * 把前面几层接成宿主认识的样子：
  *   00-util     工具（跨 realm 安全的 isArray 等）
+ *   05-qr       纯 JS 二维码编码器（ISO/IEC 18004 + PNG）
  *   10-crypto   纯 JS 的 MD5 / SHA-256 / HMAC / AES / GCM
  *   20-lan      涂鸦局域网协议（TCP 6668 + UDP 7000 发现）
- *   30-cloud    涂鸦云 OpenAPI（HMAC-SHA256 签名）
+ *   30-cloud    涂鸦云 OpenAPI（HMAC-SHA256 签名，**已弃用**，仅兼容旧凭据）
+ *   35-mobile   涂鸦手机端云 API（AES-GCM + HMAC-SHA256，扫码登录走这条）
  *   40-mapping  DP ⇄ MIoT 映射
  *   50-plugin   ← 本文件
+ *
+ * ## 三条接入路径，优先级从高到低
+ *
+ *   account  扫码登录（手机端 API）——**推荐**。一次扫码拿到设备列表、
+ *            local_key、IP、家庭/房间层级、DP ⇄ code 关系表，且**没有配额限制**。
+ *   cloud    涂鸦 IoT 平台 OpenAPI——**旧路径，保留只为兼容已存的凭据**。
+ *            试用版有 1 个月有效期 / 最多 50 台设备 / 只能控 10 台，
+ *            过期后接口一律返回 28841002。新用户直接用扫码。
+ *   local    纯局域网手填（设备 ID + localKey + IP），不需要任何云账号。
  *
  * ## 四条硬约束（每条都在 miha 的插件文档里被点名过）
  *
@@ -3448,11 +4608,38 @@ let discoveryCache = null;
 let versionHint = {};
 /** 用户手填的设备（云端模式下也保留，用来覆盖 local_key / IP / 协议版本） */
 let manualDevices = [];
+/**
+ * 扫码登录会话。**必须存在插件自己这里** —— 宿主的 `loginPoll(sessionId)`
+ * 只回传一个 sessionId，既不给轮询地址也不给用户码。
+ */
+let qrSession = null;
+/** 扫码模式下的家庭/房间缓存（`getHomes` 与 `refreshDevices` 共用一次请求） */
+let accountHomes = null;
+/** did -> { id, name } | null：房间查询结果缓存（null = 查过，确实没房间） */
+let roomCache = {};
+/** did -> 扫码账号返回的原始设备记录（含 local_key / ip，凑局域网信息时用） */
+let accountDeviceCache = {};
 
 const HOME_ID = 'tuya';
 const HOME_NAME = '涂鸦设备';
 const DISCOVERY_TTL_MS = 120000;
 const TAG = 'tuya';
+
+/** 用户码存在 secureStore 的这个 key 下（只存本机，不上传）。 */
+const USER_CODE_KEY = 'tuya_user_code';
+/**
+ * 二维码有效期 / 轮询间隔。
+ * 轮询间隔涂鸦官方文档要求 **≥ 2s**（写小了会被风控当成异常流量），
+ * `expiresIn` 与本地计时器共用，归零就报 expired。
+ */
+const QR_EXPIRES_SEC = 180;
+const QR_POLL_MS = 2000;
+
+/**
+ * 二维码里装的内容。格式来自涂鸦官方文档（扫码授权登录）：
+ * 由 App 解析出 token 后回传云端完成授权。
+ */
+const QR_LOGIN_PREFIX = 'tuyaSmart--qrLogin?token=';
 
 /** 协议版本候选：发现/提示都拿不到时按这个顺序猜（3.3 最普遍，放前面）。 */
 const VERSION_CANDIDATES = [3.3, 3.4, 3.5, 3.1];
@@ -3487,11 +4674,86 @@ async function loadAuth() {
     if (data.mode === 'cloud' && !data.endpoint) {
       data.endpoint = resolveEndpoint(data.region);
     }
+    // 扫码登录的凭据：endpoint 由扫码结果给，缺了就是坏的，交给 init 判失败
+    if (data.mode === 'account' && typeof data.endpoint !== 'string') {
+      data.endpoint = '';
+    }
     return data;
   } catch (e) {
     safeLog('error', TAG, '读取凭据失败：' + describeError(e));
     return null;
   }
+}
+
+/* ------------------------------------------------------------ 用户码 */
+
+/**
+ * 读涂鸦用户码。
+ *
+ * 它是**账号级别的常量**（涂鸦 App：我的 → 设置 → 账号与安全 → 用户码），
+ * 扫码建单这一步服务端会校验它 —— 我们实测过：空值或瞎填都返回
+ * `USERCODE_INCORRECT`。所以必须让用户填一次，之后一直复用。
+ */
+async function loadUserCode() {
+  try {
+    const stored = await Host.secureStore.get(USER_CODE_KEY);
+    if (!stored) return '';
+    return strOf(typeof stored === 'string' ? stored : stored.value).trim();
+  } catch (e) {
+    safeLog('error', TAG, '读取用户码失败：' + describeError(e));
+    return '';
+  }
+}
+
+async function saveUserCode(code) {
+  await Host.secureStore.set(USER_CODE_KEY, strOf(code).trim());
+}
+
+async function clearUserCode() {
+  try {
+    await Host.secureStore.delete(USER_CODE_KEY);
+  } catch (e) {
+    safeLog('error', TAG, '清除用户码失败：' + describeError(e));
+  }
+}
+
+/**
+ * 首次登录要的用户码表单。
+ *
+ * 只在这个表单里出现一次：用户码存下来之后，`loginBegin` 就直接给二维码了。
+ * 局域网手填设备也留在这里（两条路径可以共存，手填的会覆盖云端的 IP / localKey）。
+ *
+ * ⚠️ `form` 的字段类型只有 text / password / switch，且**所有值都是字符串**。
+ *    未知类型会被当成 text，不会报错。
+ */
+function userCodeFormView(notice) {
+  const suffix = notice ? '（' + notice + '）' : '';
+  return {
+    type: 'form',
+    hint: '首次使用需要一次「用户码」：涂鸦 App → 我的 → 右上角齿轮 → 账号与安全 → 底部「用户码」。'
+      + '填好后提交，再点一次「登录」即可看到二维码。',
+    fields: [
+      {
+        key: 'userCode',
+        label: '涂鸦用户码' + suffix,
+        type: 'text',
+        placeholder: '用户码只在涂鸦 App 里显示，区分大小写'
+      },
+      {
+        key: 'manual',
+        label: '局域网设备（可选，每行一台，也可用分号隔开）',
+        type: 'text',
+        placeholder: '设备ID,localKey,IP[,协议版本][,名称]'
+      },
+      {
+        key: 'category',
+        label: '默认品类码（可选）',
+        type: 'text',
+        placeholder: '如 dj / kg / wk / cl，用于套用参考模板'
+      }
+    ],
+    submitLabel: '保存用户码'
+  };
 }
 
 async function saveAuth() {
@@ -3506,6 +4768,22 @@ function syncManualFromAuth() {
 
 function hasCloud() {
   return !!(auth && auth.mode === 'cloud' && auth.accessId && auth.accessSecret && auth.endpoint);
+}
+
+/**
+ * 是否已扫码登录（手机端账号模式）。
+ *
+ * 判据是 **endpoint + refreshToken**，不是 accessToken —— accessToken 只有
+ * 2 小时，过期后靠 refreshToken 静默换新的（`mobileEnsureToken` 负责），
+ * 拿它当判据会让插件在每次 token 过期时误判成"没登录"。
+ */
+function hasAccount() {
+  return !!(auth && auth.mode === 'account' && auth.endpoint && auth.refreshToken);
+}
+
+/** 有没有任意一条云通道（用于决定要不要挂 cloud transport）。 */
+function hasAnyCloud() {
+  return hasAccount() || hasCloud();
 }
 
 /** 从任何形状里取 did：字符串/数字直接用，对象读 .did。 */
@@ -3671,17 +4949,32 @@ async function ensureLanInfo(did, _device) {
   if (cur && cur.ip && cur.key) return cur;
 
   // ② 云端详情：local_key 只有这里能给
-  if (hasCloud() && !(cur && cur.key)) {
-    const det = await cloudGetDeviceDetail(auth, d);
-    if (det && det.localKey) {
-      cur = lanInfoCache[d] || { ip: '', key: '', version: 0, category: '' };
-      lanInfoCache[d] = {
-        ip: cur.ip || det.ip || '',
-        key: det.localKey,
-        version: cur.version || 0,
-        category: cur.category || det.category || ''
-      };
-      if (det.category && !categoryCache[d]) categoryCache[d] = det.category;
+  if (!(cur && cur.key)) {
+    if (hasAccount()) {
+      // 扫码账号的设备列表里**本来就带 local_key 和 ip**（开放平台反而要再查一次详情）
+      const rec = await ensureAccountDevice(d);
+      if (rec && rec.key) {
+        const base = lanInfoCache[d] || { ip: '', key: '', version: 0, category: '' };
+        lanInfoCache[d] = {
+          ip: base.ip || rec.ip || '',
+          key: rec.key,
+          version: base.version || 0,
+          category: base.category || rec.category || ''
+        };
+        if (rec.category && !categoryCache[d]) categoryCache[d] = normDpCode(rec.category);
+      }
+    } else if (hasCloud()) {
+      const det = await cloudGetDeviceDetail(auth, d);
+      if (det && det.localKey) {
+        cur = lanInfoCache[d] || { ip: '', key: '', version: 0, category: '' };
+        lanInfoCache[d] = {
+          ip: cur.ip || det.ip || '',
+          key: det.localKey,
+          version: cur.version || 0,
+          category: cur.category || det.category || ''
+        };
+        if (det.category && !categoryCache[d]) categoryCache[d] = det.category;
+      }
     }
   }
 
@@ -3728,6 +5021,7 @@ function candidateVersions(did) {
 /** 内部记录 → 宿主认的 Device 形状（**米家字段名**）。 */
 function toMihaDevice(rec) {
   const info = categoryInfo(rec.category);
+  const roomId = strOf(rec.roomId);
   return {
     did: String(rec.did),
     name: String(rec.name || rec.did),
@@ -3736,10 +5030,10 @@ function toMihaDevice(rec) {
     //（getSpecForDevice 按 did 查自己的映射表），但形状得像那么回事 ——
     // 给一个稳定、合法的 MIoT urn。
     spec_type: 'urn:miot-spec-v2:device:' + info.device + ':0000A001:tuya:1',
-    room_id: '',
-    room_name: '',
-    home_id: HOME_ID,
-    home_name: HOME_NAME,
+    room_id: roomId,
+    room_name: roomId ? strOf(rec.roomName) : '',
+    home_id: strOf(rec.homeId) || HOME_ID,
+    home_name: strOf(rec.homeName) || HOME_NAME,
     isOnline: rec.online !== false,
     token: String(rec.key || ''),
     local_ip: String(rec.ip || ''),
@@ -3756,20 +5050,247 @@ function toMihaDevice(rec) {
   };
 }
 
+/* --------------------------------------------------------- 扫码账号：家庭 */
+
+/**
+ * 取家庭列表（一次会话内缓存）。
+ *
+ * 家庭 id 是涂鸦的 `ownerId`（SDK 也这么用）。顺手把它转成宿主认的
+ * `Home` 形状所需的数据 —— 但 `roomlist` 要等房间查完才能填。
+ */
+async function ensureAccountHomes() {
+  if (isArray(accountHomes)) return accountHomes;
+  const list = await mobileGetHomes(auth);
+  accountHomes = list;
+  return accountHomes;
+}
+
+/**
+ * 把每台设备所在的房间补进记录里。
+ *
+ * ⚠️ 这是个"一台设备一次请求"的接口（`/v1.0/m/thing/ha/{did}/room`），
+ * 几十台设备串行拉会明显拖慢列表 —— 所以：
+ *   ① 结果按 did 缓存（房间基本不变，一次会话里查一次就够）；
+ *   ② 并发拉，但限制并发数（涂鸦对突发流量敏感）。
+ */
+async function fillRooms(recs) {
+  const todo = [];
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    const hit = roomCache[r.did];
+    if (hit !== undefined) {
+      applyRoom(r, hit);
+    } else {
+      todo.push(r);
+    }
+  }
+  if (todo.length === 0) return;
+
+  const CONCURRENCY = 6;
+  let cursor = 0;
+  const worker = async function () {
+    while (cursor < todo.length) {
+      const rec = todo[cursor++];
+      let room = null;
+      try {
+        room = await mobileGetRoomByDevice(auth, rec.did);
+      } catch (e) {
+        // 查不到房间不是错误（设备本来就可能不在任何房间），记 null 别重试
+        room = null;
+      }
+      roomCache[rec.did] = room;
+      applyRoom(rec, room);
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < Math.min(CONCURRENCY, todo.length); i++) workers.push(worker());
+  await Promise.all(workers);
+}
+
+function applyRoom(rec, room) {
+  if (!room) return;
+  rec.roomId = String(room.id || '');
+  rec.roomName = String(room.name || '');
+}
+
+/**
+ * 取一台设备的账号侧原始记录（含 local_key / ip）。
+ *
+ * 缓存优先；缓存没有就按 id 补拉一次 —— 这样"先在列表里看到设备、后来才点进去控制"
+ * 这种顺序下也不会白跑请求。
+ */
+async function ensureAccountDevice(did) {
+  const d = String(did);
+  const hit = accountDeviceCache[d];
+  if (hit !== undefined) return hit;
+  let rec = null;
+  try {
+    const list = await mobileGetDevicesByIds(auth, [d]);
+    if (isArray(list) && list.length > 0) rec = list[0];
+  } catch (e) {
+    safeLog('error', TAG, '补拉设备详情失败（' + d + '）：' + describeError(e));
+  }
+  if (!rec) return null;
+  const norm = {
+    key: strOf(rec.local_key || rec.localKey),
+    ip: strOf(rec.ip),
+    category: strOf(rec.category),
+    name: strOf(rec.name)
+  };
+  accountDeviceCache[d] = norm;
+  return norm;
+}
+
+/* ---------------------------------------------------- 家庭容器（宿主形状） */
+
+function homeUid() {
+  return (auth && auth.uid) ? String(auth.uid) : 'tuya';
+}
+
+/** 兜底家庭：OpenAPI / 纯局域网，以及账号下"一个家庭都没有"的情况。 */
+function fixedHome() {
+  const dids = [];
+  const keys = Object.keys(deviceCache);
+  for (let i = 0; i < keys.length; i++) dids.push(keys[i]);
+  return {
+    id: HOME_ID,
+    name: HOME_NAME,
+    uid: homeUid(),
+    dids: dids,
+    roomlist: [],
+    city_id: '',
+    longitude: 0,
+    latitude: 0,
+    address: ''
+  };
+}
+
+/**
+ * 用 `deviceCache` 里已经补好的 `home_id` / `room_id` 组装真实层级。
+ *
+ * 只做纯映射，不发请求 —— 设备信息由 `refreshDevices` 负责拉全，
+ * 这里再查一遍纯属浪费。
+ */
+function buildAccountHomes(homes) {
+  const out = [];
+  const byId = {};
+  for (let i = 0; i < homes.length; i++) {
+    const h = homes[i];
+    const o = {
+      id: String(h.id),
+      name: String(h.name || h.id),
+      uid: homeUid(),
+      dids: [],
+      roomlist: [],
+      city_id: '',
+      longitude: 0,
+      latitude: 0,
+      address: ''
+    };
+    out.push(o);
+    byId[o.id] = o;
+  }
+  if (out.length === 0) return [fixedHome()];
+
+  const roomIndex = {};
+  const keys = Object.keys(deviceCache);
+  for (let i = 0; i < keys.length; i++) {
+    const dev = deviceCache[keys[i]];
+    // 家庭对不上的设备（接口偶尔会给个没见过的 homeId）挂到第一个家庭，
+    // 不然它会在界面上凭空消失
+    const home = byId[strOf(dev.home_id)] || out[0];
+    home.dids.push(dev.did);
+    const rid = strOf(dev.room_id);
+    if (!rid) continue;
+    const rk = home.id + '|' + rid;
+    let room = roomIndex[rk];
+    if (!room) {
+      room = { id: rid, name: strOf(dev.room_name) || rid, dids: [] };
+      roomIndex[rk] = room;
+      home.roomlist.push(room);
+    }
+    room.dids.push(dev.did);
+  }
+  return out;
+}
+
 /**
  * 拉一遍设备清单。
  *
- * ⚠️ **不还原涂鸦云的家庭 / 房间层级**：那要靠 `/v1.0/users/{uid}/homes`
- * 这类接口，而不同账号（项目维度 vs 账号维度）的开放程度不一样。
- * 猜出来的层级只会让用户看到"设备跑错房间"，所以统一收进一个
- * 「涂鸦设备」家庭 —— 宁可不猜。
+ * 三条来源合并：
+ *   ① 扫码账号（`/v1.0/m/life/ha/home/devices`）——**会还原真实的家庭 / 房间层级**，
+ *      并且带 local_key 与 ip，是唯一能同时拿到"控制钥匙"和"分组"的来源；
+ *   ② 云 OpenAPI（旧路径，仅兼容存量凭据）——拿不到家庭/房间，统一收进一个家庭；
+ *   ③ 用户手填的设备——总是保留，可以覆盖 ①② 里不对的 IP / localKey。
  */
 async function refreshDevices() {
   const recs = [];
   const seen = {};
 
-  // ① 云端设备列表
-  if (hasCloud()) {
+  // ① 扫码账号：家庭 → 设备 → 房间
+  if (hasAccount()) {
+    let homes = [];
+    try {
+      homes = await ensureAccountHomes();
+    } catch (e) {
+      safeLog('error', TAG, '拉取涂鸦家庭列表失败：' + describeError(e));
+    }
+    // 家庭列表拿不到（或账号还没建家庭）时退成一个占位家庭 ——
+    // 宁可没有分组，也不能因为这一步失败就一台设备都列不出来。
+    if (homes.length === 0) homes = [{ id: HOME_ID, name: HOME_NAME }];
+
+    const accountRecs = [];
+    for (let h = 0; h < homes.length; h++) {
+      const home = homes[h];
+      let list = [];
+      try {
+        list = await mobileGetDevicesByHome(auth, home.id);
+      } catch (e) {
+        safeLog('error', TAG, '拉取家庭「' + home.name + '」的设备失败：' + describeError(e));
+        continue;
+      }
+      for (let i = 0; i < list.length; i++) {
+        const d = list[i] || {};
+        const did = strOf(d.id);
+        if (!did || seen[did]) continue;
+        seen[did] = true;
+        if (d.category) categoryCache[did] = normDpCode(d.category);
+        const rec = {
+          did: did,
+          name: d.name,
+          category: d.category,
+          productId: d.product_id || d.productId,
+          productName: d.product_name || d.productName,
+          online: d.online,
+          ip: d.ip || '',
+          uuid: d.uuid,
+          // ⚠️ 整条链路最值钱的一个字段：local_key 是局域网直控的钥匙，
+          //    只有账号模式（扫码）拿得到。开放平台的设备列表接口不给它。
+          key: d.local_key || '',
+          homeId: home.id,
+          homeName: home.name,
+          roomId: '',
+          roomName: ''
+        };
+        accountRecs.push(rec);
+        recs.push(rec);
+        accountDeviceCache[did] = {
+          key: rec.key,
+          ip: rec.ip,
+          category: strOf(d.category),
+          name: strOf(d.name)
+        };
+      }
+    }
+
+    // 房间是"一台设备一次查询"的接口，按 did 缓存 + 并发拉，避免每次刷新都重来
+    try {
+      await fillRooms(accountRecs);
+    } catch (e) {
+      safeLog('error', TAG, '补全房间信息失败：' + describeError(e));
+    }
+  } else if (hasCloud()) {
+    // ② 云 OpenAPI 设备列表（旧路径）
     let list = [];
     try {
       list = await cloudListDevices(auth);
@@ -3795,7 +5316,7 @@ async function refreshDevices() {
     }
   }
 
-  // ② 手填的设备（云端模式下作为补充 / 覆盖）
+  // ③ 手填的设备（云端模式下作为补充 / 覆盖）
   for (let i = 0; i < manualDevices.length; i++) {
     const m = manualDevices[i];
     if (!m.did) continue;
@@ -3899,8 +5420,15 @@ async function ensureMapping(did, _device) {
   let category = knownCategory(d);
 
   // ① 云 spec
-  if (hasCloud()) {
-    const spec = await cloudGetSpec(auth, d);
+  if (hasAnyCloud()) {
+    let spec = null;
+    try {
+      // 扫码账号走手机端接口：它的 DP 关系表**带 dp_id**，而局域网写要靠数字编号寻址，
+      // 所以这一份比开放平台的 specification 更全。
+      spec = hasAccount() ? await mobileGetSpec(auth, d) : await cloudGetSpec(auth, d);
+    } catch (e) {
+      safeLog('error', TAG, '取云规格失败（' + d + '）：' + describeError(e));
+    }
     if (spec) {
       if (!category && spec.category) category = strOf(spec.category);
       const fns = functionsFromCloudSpec(spec);
@@ -3941,7 +5469,7 @@ async function ensureMapping(did, _device) {
 
   throw new Error(
     '读不到设备功能点：'
-    + (hasCloud()
+    + (hasAnyCloud()
       ? '云端没有返回该设备的 specification，'
       : '当前没有配置云凭据，')
     + (info
@@ -4023,6 +5551,27 @@ function lookupDpValue(dps, entry) {
   return undefined;
 }
 
+/**
+ * 扫码账号模式下读一次设备状态快照。
+ *
+ * `/v1.0/m/life/ha/devices/detail?devIds=<did>` 的返回里就带 `status` 数组，
+ * 但**上报方式分两种**：`supportLocal=true` 的设备用 `[{dpId, value}]`，
+ * 其余用 `[{code, value}]`。`mobileNormalizeStatus` 借 DP 关系表把 dpId 归一成
+ * code，这样后面 `lookupDpValue` 按 code 兜底也能命中。
+ */
+async function accountReadStatus(did) {
+  const list = await mobileGetDevicesByIds(auth, [String(did)]);
+  const dev = (isArray(list) && list.length > 0) ? list[0] : null;
+  if (!dev) return null;
+  let relations = null;
+  try {
+    relations = await mobileGetDpRelations(auth, String(did));
+  } catch (e) {
+    safeLog('error', TAG, '取 DP 关系表失败（' + did + '）：' + describeError(e));
+  }
+  return mobileNormalizeStatus(dev.status, relations);
+}
+
 /* ----------------------------------------------------- 批量读（模块函数，不吃 this） */
 
 /**
@@ -4044,8 +5593,10 @@ async function readPropertiesInternal(transportId, did, params) {
   // 一次快照覆盖全部请求项 —— 局域网读一次比读 N 次省太多
   let dps;
   if (transportId === 'cloud') {
-    if (!hasCloud()) throw new Error('没有可用的云凭据');
-    dps = await cloudGetDeviceStatus(auth, d);
+    if (!hasAnyCloud()) throw new Error('没有可用的云凭据');
+    dps = hasAccount()
+      ? await accountReadStatus(d)
+      : await cloudGetDeviceStatus(auth, d);
     if (!dps) throw new Error('云端读取设备状态失败（' + d + '）');
   } else {
     const info = await ensureLanInfo(d, null);
@@ -4090,7 +5641,15 @@ Plugin.register({
       syncManualFromAuth();
       for (let i = 0; i < manualDevices.length; i++) absorbManualLan(manualDevices[i]);
 
-      if (auth.mode === 'cloud') {
+      if (auth.mode === 'account') {
+        // 扫码登录拿到的凭据：endpoint + refreshToken 是"能自愈"的最小集合
+        if (!auth.endpoint || !auth.refreshToken) {
+          safeLog('error', TAG, '扫码凭据不完整（缺 endpoint 或 refreshToken），需要重新登录');
+          return false;
+        }
+        // ⚠️ 同 cloud 模式：**不**在 init 里刷新 token。冷启动做外呼会让用户
+        //    看到"已登录但一直转圈"，刷新推迟到真正要用的时候（mobileEnsureToken）。
+      } else if (auth.mode === 'cloud') {
         if (!auth.accessId || !auth.accessSecret) {
           safeLog('error', TAG, '凭据里缺 accessId / accessSecret');
           return false;
@@ -4117,133 +5676,92 @@ Plugin.register({
   },
 
   /**
-   * ② 登录视图：一张表单同时覆盖两种接入方式。
+   * ② 登录第一步：出视图。
    *
-   * `form` 的字段类型只有 text / password / switch，且**所有值都是字符串**
-   * （switch 给的是 'true' / 'false'）。宿主不支持"按开关显示/隐藏字段"，
-   * 所以两套字段都摆出来，提交时按 useCloud 取用对应的一半。
+   * ⚠️ 涂鸦的扫码登录**必须先拿到「用户码」**。它是账号级常量
+   *    （涂鸦 App：我的 → 设置（右上角齿轮）→ 账号与安全 → 底部「用户码」），
+   *    服务端在建单时就校验它 —— 实测空值或瞎填一律返回 `USERCODE_INCORRECT`。
+   *
+   * 但宿主的 `qr` 视图**只能放一张图**，没有输入框：协议里 `view.type` 三选一，
+   * 且 `loginSubmit` 没法定向到"下一个视图"。所以首次登录分两步走：
+   *
+   *     第一次点「登录」→ 出一个只填用户码的表单
+   *     填好提交       → 用户码存进 secureStore
+   *     再点一次「登录」→ 直接出二维码，之后就永远是一步到位
+   *
+   * 这是宿主视图模型下唯一走得通的两步方案（详见 loginSubmit 的注释）。
    */
   async loginBegin() {
+    const sessionId = 'tuya-' + Date.now();
+
+    const userCode = await loadUserCode();
+    if (!userCode) return { sessionId: sessionId, view: userCodeFormView('') };
+
+    let token;
+    try {
+      token = await mobileQrCreate(userCode);
+    } catch (e) {
+      const msg = describeError(e);
+      // 用户码失效（换过账号 / 在 App 里被重置）→ 清掉并退回表单。
+      // 不清的话用户会卡在一个"每次都失败"的二维码上，而且没有任何输入入口。
+      if (/USERCODE/i.test(msg)) {
+        await clearUserCode();
+        return {
+          sessionId: sessionId,
+          view: userCodeFormView('原用户码已失效，请重新填写')
+        };
+      }
+      throw new Error('生成登录二维码失败：' + msg);
+    }
+
+    qrSession = {
+      id: sessionId,
+      userCode: userCode,
+      token: token,
+      expireAt: Date.now() + QR_EXPIRES_SEC * 1000
+    };
+
+    // ⚠️ 二维码在**本地**生成（05-qr.js），绝不交给第三方二维码服务 ——
+    //    那等于把登录令牌发给了别人。宿主只认 http(s) / data: 两种 imageUrl。
+    const dataUri = qrMakePngDataUri(QR_LOGIN_PREFIX + token, 5, 4, 'Q');
     return {
-      sessionId: 'tuya-' + Date.now(),
+      sessionId: sessionId,
       view: {
-        type: 'form',
-        fields: [
-          {
-            key: 'useCloud',
-            label: '使用涂鸦云 OpenAPI（关闭则纯局域网）',
-            type: 'switch',
-            default: 'true'
-          },
-          {
-            key: 'accessId',
-            label: '云 Access ID',
-            type: 'text',
-            placeholder: '涂鸦 IoT 平台的 Access ID / Client ID'
-          },
-          {
-            key: 'accessSecret',
-            label: '云 Access Secret',
-            type: 'password',
-            placeholder: '只存在本机，不会上传到别处'
-          },
-          {
-            key: 'region',
-            label: '数据中心',
-            type: 'text',
-            default: 'cn',
-            placeholder: 'cn / us / eu / in，或完整域名'
-          },
-          {
-            key: 'devices',
-            label: '局域网设备（每行一台，多台用分号隔开）',
-            type: 'text',
-            placeholder: '设备ID,localKey,IP[,协议版本][,名称]'
-          },
-          {
-            key: 'category',
-            label: '默认品类码（可选）',
-            type: 'text',
-            placeholder: '如 dj / kg / wk / cl，用于套用参考模板'
-          }
-        ],
-        submitLabel: '保存并连接'
+        type: 'qr',
+        imageUrl: dataUri,
+        hint: '用「涂鸦智能 / 智能生活」App 的扫一扫',
+        expiresIn: QR_EXPIRES_SEC,
+        // 必须 > 0，否则宿主**根本不会轮询**，用户扫了也没反应且不报错。
+        // 涂鸦官方要求轮询间隔 ≥ 2s。
+        pollInterval: QR_POLL_MS
       }
     };
   },
 
   /**
-   * ③ 提交。
+   * ③ 提交用户码 / 局域网设备。
    *
-   * 云模式会**真发一次换 token 的请求**来校验凭据 —— 与其让用户以为登录成功、
-   * 进列表才发现一个设备都没有，不如当场报错。
-   * 局域网模式只做本地解析与格式校验（不联机：设备可能在旁边但没开机，
-   * 那不该拦住用户保存配置）。
+   * 用户码会**真去服务端验一次**（建单接口本身就是校验接口）—— 与其让用户以为
+   * 存好了、第二次点登录才发现填错，不如当场告诉他错在哪。
    *
-   * 手填设备是**累加**的：再次登录只填云凭据不会把手填的局域网设备冲掉。
+   * 手填设备是**累加**的：再次登录只填用户码不会把手填的局域网设备冲掉。
    */
   async loginSubmit(_sessionId, fields) {
     const f = fields || {};
-    const useCloud = strOf(f.useCloud) !== 'false';
+    const userCode = strOf(f.userCode).trim();
     const defaultCategory = normDpCode(f.category);
 
     const prevManual = (auth && isArray(auth.manual)) ? auth.manual.slice() : manualDevices.slice();
 
     let parsedManual = [];
     try {
-      parsedManual = parseManualText(f.devices, defaultCategory);
+      parsedManual = parseManualText(f.manual, defaultCategory);
     } catch (e) {
       return { state: 'error', message: '设备列表解析失败：' + describeError(e) };
     }
 
-    if (useCloud) {
-      const accessId = strOf(f.accessId);
-      const accessSecret = strOf(f.accessSecret);
-      if (!accessId || !accessSecret) {
-        return { state: 'error', message: '请填写云 Access ID 与 Access Secret' };
-      }
-      const region = strOf(f.region) || 'cn';
-      const candidate = {
-        mode: 'cloud',
-        accessId: accessId,
-        accessSecret: accessSecret,
-        region: region,
-        endpoint: resolveEndpoint(region),
-        accessToken: '',
-        refreshToken: '',
-        expireTime: 0,
-        uid: '',
-        manual: []
-      };
-      try {
-        await cloudGetToken(candidate);
-      } catch (e) {
-        return { state: 'error', message: '云凭据校验失败：' + describeError(e) };
-      }
-
-      auth = candidate;
-      mergeManual(prevManual, parsedManual);
-      auth.manual = manualDevices.slice();
-
-      // 顺手拉一次，好让用户立刻看到设备；拉不到也不阻断登录
-      try {
-        await refreshDevices();
-      } catch (e) {
-        safeLog('error', TAG, '登录后拉取设备失败：' + describeError(e));
-      }
-      await saveAuth();
-      safeLog('info', TAG, '云模式登录成功，uid=' + (auth.uid || '?'));
-      return { state: 'success' };
-    }
-
-    // ── 纯局域网 ──────────────────────────────────────────────
-    if (parsedManual.length === 0 && prevManual.length === 0) {
-      return {
-        state: 'error',
-        message: '局域网模式下至少要填一台设备，格式：设备ID,localKey,IP[,协议版本][,名称]'
-      };
-    }
-    // localKey 必须是 16 个字符 —— 早点拦住比等连接超时好
+    // localKey 必须是 16 个字符 —— 早点拦住比等连接超时好。
+    // 放在验用户码之前：两处都填错时，先报本地能立刻判定的那个。
     for (let i = 0; i < parsedManual.length; i++) {
       const e = parsedManual[i];
       if (!e.key) continue;
@@ -4256,55 +5774,173 @@ Plugin.register({
       }
     }
 
-    auth = {
-      mode: 'local',
-      region: '',
-      endpoint: '',
-      accessId: '',
-      accessSecret: '',
-      accessToken: '',
-      refreshToken: '',
-      expireTime: 0,
-      uid: '',
-      manual: []
+    // ── 没填用户码 ────────────────────────────────────────────
+    // ⚠️ **绝不能把手上有效的账号凭据丢掉**。"我只是想补一台手填设备" 是很常见的
+    //    操作，而表单里的用户码字段默认是空的 —— 不特判的话，一次手滑提交就让
+    //    用户从"已登录"掉回"没登录"。所以有账号凭据就保留，只合并手填设备。
+    if (!userCode) {
+      const keepAccount = !!(auth && auth.mode === 'account' && auth.refreshToken);
+      if (parsedManual.length === 0 && prevManual.length === 0 && !keepAccount) {
+        return {
+          state: 'error',
+          message: '请填写涂鸦「用户码」（扫码登录用）；或者至少填一台局域网设备，'
+            + '格式：设备ID,localKey,IP[,协议版本][,名称]'
+        };
+      }
+      if (!keepAccount) {
+        auth = {
+          mode: 'local',
+          region: '',
+          endpoint: '',
+          accessId: '',
+          accessSecret: '',
+          accessToken: '',
+          refreshToken: '',
+          expireTime: 0,
+          uid: '',
+          manual: []
+        };
+      }
+      mergeManual(prevManual, parsedManual);
+      auth.manual = manualDevices.slice();
+      for (let i = 0; i < manualDevices.length; i++) absorbManualLan(manualDevices[i]);
+      await saveAuth();
+      safeLog('info', TAG, (keepAccount ? '保留账号登录，' : '局域网模式')
+        + '已保存 ' + manualDevices.length + ' 台手填设备');
+      return { state: 'success' };
+    }
+
+    // ── 验用户码 ────────────────────────────────────────────
+    try {
+      await mobileQrCreate(userCode);
+    } catch (e) {
+      const msg = describeError(e);
+      if (/USERCODE/i.test(msg)) {
+        return {
+          state: 'error',
+          message: '用户码不正确。请到涂鸦 App：我的 → 右上角齿轮 → 账号与安全 → '
+            + '拉到底部的「用户码」，完整抄过来（区分大小写）。'
+        };
+      }
+      return { state: 'error', message: '校验用户码失败：' + msg };
+    }
+
+    await saveUserCode(userCode);
+
+    // 顺手把手填设备存下来（两条路径可以共存，手填的会覆盖云端的 IP / localKey）
+    if (parsedManual.length > 0) {
+      if (!auth) {
+        auth = {
+          mode: 'local', region: '', endpoint: '', accessId: '', accessSecret: '',
+          accessToken: '', refreshToken: '', expireTime: 0, uid: '', manual: []
+        };
+      }
+      mergeManual(prevManual, parsedManual);
+      auth.manual = manualDevices.slice();
+      for (let i = 0; i < manualDevices.length; i++) absorbManualLan(manualDevices[i]);
+      await saveAuth();
+    }
+
+    // ⚠️ 返回 `error` 是**故意的**，不是失败：协议里 `loginSubmit` 只能回一个
+    //    `{state}`，没法说"下一步给你看二维码"。用户码此刻已经存好了，用户照着
+    //    提示再点一次「登录」，`loginBegin` 就会返回 `qr` 视图。
+    //    用「已通过」而不是「已保存」开头，是为了让这条红字读起来像进度而不是报错。
+    return {
+      state: 'error',
+      message: '用户码已校验通过 ✓ 请关闭本窗口，再点一次卡片上的「登录」，'
+        + '二维码就会显示出来（只需这一次）。'
     };
-    mergeManual(prevManual, parsedManual);
-    auth.manual = manualDevices.slice();
-    for (let i = 0; i < manualDevices.length; i++) absorbManualLan(manualDevices[i]);
+  },
+
+  /**
+   * ④ 轮询扫码结果。
+   *
+   * ⚠️ 宿主**只传 sessionId**（轮询要用的用户码和 token 存在 `qrSession` 里），
+   *    所以这里绝对不能把参数当成会话用。
+   * ⚠️ 「还没扫」必须返回 `pending`：宿主连续 3 次收到异常就判登录失败并关弹窗，
+   *    用户刚掏出手机二维码就没了。网络抖动同理。
+   */
+  async loginPoll(sessionId) {
+    if (!qrSession || qrSession.id !== sessionId) return { state: 'pending' };
+    if (Date.now() > qrSession.expireAt) {
+      qrSession = null;
+      return { state: 'expired', message: '二维码已过期，请重新点「登录」获取新的二维码。' };
+    }
+
+    let r;
+    try {
+      r = await mobileQrPoll(qrSession.userCode, qrSession.token);
+    } catch (e) {
+      // 网络抖动按 pending 处理，交给宿主的重试容忍
+      safeLog('error', TAG, '轮询扫码结果失败：' + describeError(e));
+      return { state: 'pending' };
+    }
+    // success:false 就是"还没扫" —— 不是错误
+    if (!r || !r.ok) return { state: 'pending' };
+
+    const userCode = qrSession.userCode;
+    let next;
+    try {
+      next = mobileAuthFromLogin(userCode, r.result);
+    } catch (e) {
+      qrSession = null;
+      return { state: 'error', message: '扫码结果不完整：' + describeError(e) };
+    }
+
+    // 手填设备要跨模式保留 —— 扫码不能把用户手工配的局域网覆盖冲掉
+    const keepManual = (auth && isArray(auth.manual)) ? auth.manual.slice() : manualDevices.slice();
+    next.manual = keepManual;
+
+    auth = next;
+    qrSession = null;
+    accountHomes = null;
+    roomCache = {};
+    accountDeviceCache = {};
+    lanInfoCache = {};
+    manualDevices = keepManual.slice();
+
+    // ⚠️ **先落盘再预热**：把凭据持久化放在拉设备之前。拉设备要发好几个请求，
+    //    万一中间出点什么，登录本身不该受影响 —— 用户重新登录一次的成本太高。
     await saveAuth();
-    safeLog('info', TAG, '局域网模式已保存 ' + manualDevices.length + ' 台设备');
+
+    // 顺手拉一次，好让用户立刻看到设备；拉不到也不影响登录（凭据已经存好了）
+    try {
+      await refreshDevices();
+    } catch (e) {
+      safeLog('error', TAG, '登录后拉取设备失败：' + describeError(e));
+    }
+    safeLog('info', TAG, '扫码登录成功，uid=' + (auth.uid || '?')
+      + '，设备 ' + Object.keys(deviceCache).length + ' 台');
     return { state: 'success' };
   },
 
-  /** form 视图没有轮询。**不能抛错** —— 宿主连续 3 次失败就判登录失败并关弹窗。 */
-  async loginPoll() {
-    return { state: 'pending' };
-  },
-
   async loginCancel() {
+    qrSession = null;
     return { state: 'cancelled' };
   },
 
   /**
-   * ④ 家庭容器。
+   * ⑤ 家庭容器。
    *
    * ⚠️ 字段名必须是 `id` / `name` / `uid` / `dids` / `roomlist`。
    * 写成 roomIds / deviceIds 的话宿主会解析出一个空家庭（它不会猜字段名）。
+   *
+   * 扫码账号能还原**真实的家庭 / 房间层级**（这是手机端接口相对 OpenAPI 的
+   * 一大优势）；OpenAPI 与纯局域网拿不到层级，统一收进一个家庭。
    */
   async getHomes() {
-    const dids = [];
-    const keys = Object.keys(deviceCache);
-    for (let i = 0; i < keys.length; i++) dids.push(keys[i]);
-    return [{
-      id: HOME_ID,
-      name: HOME_NAME,
-      uid: (auth && auth.uid) ? String(auth.uid) : 'tuya',
-      dids: dids,
-      roomlist: []
-    }];
+    if (hasAccount()) {
+      try {
+        const homes = await ensureAccountHomes();
+        if (homes.length > 0) return buildAccountHomes(homes);
+      } catch (e) {
+        safeLog('error', TAG, '拉取家庭列表失败：' + describeError(e));
+      }
+    }
+    return [fixedHome()];
   },
 
-  /** ⑤ 设备列表。key 必须是 did，值必须是 JSON 可序列化的普通对象。 */
+  /** ⑥ 设备列表。key 必须是 did，值必须是 JSON 可序列化的普通对象。 */
   async getDevices() {
     const out = await refreshDevices();
     const n = Object.keys(out).length;
@@ -4317,7 +5953,7 @@ Plugin.register({
   },
 
   /**
-   * ⑥ 能力描述 —— 真正实现，因为 plugin.json 里 capabilities.spec = true。
+   * ⑦ 能力描述 —— 真正实现，因为 plugin.json 里 capabilities.spec = true。
    * 返回 MIoT instance JSON，宿主自己解析（与内置 mijia-cloud 的契约一致）。
    */
   async getSpecForDevice(device) {
@@ -4328,7 +5964,7 @@ Plugin.register({
   },
 
   /**
-   * ⑦ 控制通道。priority 小的先试。
+   * ⑧ 控制通道。priority 小的先试。
    *
    * 局域网排前面：更快、不烧云配额。但**能不能真的用**交给
    * `isTransportAvailable` 判断 —— 宿主对写操作"只在第一条可用通道上执行一次、
@@ -4339,11 +5975,14 @@ Plugin.register({
     const out = [];
     const cached = lanInfoCache[did];
     const manual = findManual(did);
-    const canLan = !!((cached && cached.ip && cached.key) || (manual && manual.ip && manual.key));
-    if (canLan || hasCloud() || manual) {
+    const acc = accountDeviceCache[did];
+    const canLan = !!((cached && cached.ip && cached.key)
+      || (manual && manual.ip && manual.key)
+      || (acc && acc.ip && acc.key));
+    if (canLan || hasAnyCloud() || manual) {
       out.push({ id: 'lan', kind: 'lan', priority: 10 });
     }
-    if (hasCloud()) {
+    if (hasAnyCloud()) {
       out.push({ id: 'cloud', kind: 'cloud', priority: 100 });
     }
     return out;
@@ -4357,7 +5996,7 @@ Plugin.register({
    * （默认不可用会让没实现它的设备彻底点不动，所以只在"明知必然失败"时返回 false。）
    */
   async isTransportAvailable(transportId, device) {
-    if (transportId === 'cloud') return hasCloud();
+    if (transportId === 'cloud') return hasAnyCloud();
     if (transportId !== 'lan') return false;
     if (device && device.isOnline === false) return false;
     const did = didOf(device);
@@ -4370,14 +6009,14 @@ Plugin.register({
     }
   },
 
-  /** ⑧ 读单个属性。读失败 throw；"读到但没这个属性"返回 undefined。 */
+  /** ⑨ 读单个属性。读失败 throw；"读到但没这个属性"返回 undefined。 */
   async getProperty(transportId, did, siid, piid) {
     const list = await readPropertiesInternal(transportId, did, [{ siid: siid, piid: piid }]);
     return list.length > 0 ? list[0].value : undefined;
   },
 
   /**
-   * ⑨ 批量读。
+   * ⑩ 批量读。
    *
    * 兼容两种调用形状（宿主版本间有过差异，两种都接住更稳）：
    *   (transportId, did, [{siid,piid}])   ← 与内置 mijia-cloud 一致
@@ -4393,7 +6032,7 @@ Plugin.register({
   },
 
   /**
-   * ⑩ 写属性。
+   * ⑪ 写属性。
    *
    * ⚠️ 失败必须 throw —— 返回 false / undefined 会被宿主当成功。
    * ⚠️ 同 getProperties，兼容 `(device, siid, piid, value)` 的短形状。
@@ -4420,9 +6059,16 @@ Plugin.register({
     const dpValue = miotValueToDp(entry, value);
 
     if (transportId === 'cloud') {
-      if (!hasCloud()) throw new Error('没有可用的云凭据');
-      // 云侧按 code 寻址
-      await cloudSetDeviceStatus(auth, d, [{ code: entry.code, value: dpValue }]);
+      if (!hasAnyCloud()) throw new Error('没有可用的云凭据');
+      // 云侧一律按语义化 code 寻址（dp 编号只在局域网协议里有意义）
+      const cmd = [{ code: entry.code, value: dpValue }];
+      if (hasAccount()) {
+        // ⚠️ mobileRequest 在 success=false 时会抛错 —— 这正是宿主需要的行为：
+        //    返回 false / undefined 会被当成写成功，界面显示"已打开"而设备没动。
+        await mobileSendCommands(auth, d, cmd);
+      } else {
+        await cloudSetDeviceStatus(auth, d, cmd);
+      }
       safeLog('info', TAG, '云写 ' + d + ' ' + entry.code + '=' + JSON.stringify(dpValue));
       return value;
     }
@@ -4448,7 +6094,7 @@ Plugin.register({
   },
 
   /**
-   * ⑪ 执行动作。
+   * ⑫ 执行动作。
    *
    * 涂鸦**没有 MIoT 的动作模型**（DP 就是一切），所以我们生成的 spec 里
    * `actions` 恒为空数组，宿主不会调到这里。真被调到，说明有别的代码在做假设 ——
@@ -4467,7 +6113,7 @@ Plugin.register({
   },
 
   /**
-   * ⑫ 销毁。本插件没有常驻 socket / 定时器（每次读写都是"开→用→关"），
+   * ⑬ 销毁。本插件没有常驻 socket / 定时器（每次读写都是"开→用→关"），
    * 所以这里只清运行时缓存，**不清凭据** —— 清了用户就得重新登录一遍。
    */
   async dispose() {
@@ -4477,6 +6123,10 @@ Plugin.register({
     categoryCache = {};
     discoveryCache = null;
     versionHint = {};
+    accountHomes = null;
+    roomCache = {};
+    accountDeviceCache = {};
+    qrSession = null;
     pluginCtx = null;
     safeLog('info', TAG, '已释放运行时缓存');
   }

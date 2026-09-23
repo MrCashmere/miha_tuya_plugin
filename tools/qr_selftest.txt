@@ -1,0 +1,1 @@
+{"text":"tuyaSmart--qrLogin?token=0123456789abcdef","level":"Q","scale":5,"quiet":4}

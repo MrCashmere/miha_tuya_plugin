@@ -6,11 +6,15 @@
   "scripts": {
     "build": "node tools/build.js",
     "check": "node tools/build.js --check && node tools/package.js",
-    "test": "node tools/test_crypto.js && node tools/test_frames.js && node tools/test_cloud.js && node tools/test_mapping.js && node tools/test_plugin.js",
+    "test": "node tools/test_crypto.js && node tools/test_frames.js && node tools/test_qr.js && node tools/test_mobile.js && node tools/test_cloud.js && node tools/test_mapping.js && node tools/test_plugin.js",
     "test:mapping": "node tools/test_mapping.js",
     "test:plugin": "node tools/test_plugin.js",
+    "test:qr": "node tools/test_qr.js",
+    "test:mobile": "node tools/test_mobile.js",
     "gen:frames": "python tools/gen_expected_frames.py tools/expected_frames.json",
     "gen:cloud": "python tools/gen_expected_cloud.py tools/expected_cloud.json",
+    "gen:qr": "python tools/gen_expected_qr.py tools/expected_qr.json",
+    "gen:mobile": "python tools/gen_expected_mobile.py tools/expected_mobile.json",
     "package": "node tools/build.js && node tools/package.js",
     "release": "node tools/build.js && node tools/package.js"
   },

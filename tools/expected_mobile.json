@@ -1,0 +1,142 @@
+{
+ "cases": [
+  {
+   "name": "GET 无参",
+   "method": "GET",
+   "path": "/v1.0/m/life/users/homes",
+   "refreshToken": "rt-aaaabbbbccccdddd",
+   "accessToken": "at-1111222233334444",
+   "params": null,
+   "body": null,
+   "rid": "11112222-3333-4444-8555-666677778888",
+   "nonce": "Ab3Kd9MnPq2Z",
+   "headers": {
+    "X-appKey": "HA_3y9q4ak7g4ephrvke",
+    "X-requestId": "11112222-3333-4444-8555-666677778888",
+    "X-sid": "",
+    "X-time": "1758600000000",
+    "X-token": "at-1111222233334444"
+   },
+   "hashKey": "886f6cbdf4389c9787b42627c2c146f4",
+   "secret": "f4be5e06ef7f58fd",
+   "queryEnc": "",
+   "bodyEnc": "",
+   "sign": "fd316fcef2b55381508bafc854ec82a03a8f9c4b668820aab82a74c1c10f19f6"
+  },
+  {
+   "name": "GET 带 query 参数",
+   "method": "GET",
+   "path": "/v1.0/m/life/ha/home/devices",
+   "refreshToken": "rt-eeeeffff00001111",
+   "accessToken": "at-5555666677778888",
+   "params": {
+    "homeId": "home-9x8y7z"
+   },
+   "body": null,
+   "rid": "11112222-3333-4444-8555-666677778888",
+   "nonce": "Ab3Kd9MnPq2Z",
+   "headers": {
+    "X-appKey": "HA_3y9q4ak7g4ephrvke",
+    "X-requestId": "11112222-3333-4444-8555-666677778888",
+    "X-sid": "",
+    "X-time": "1758600000000",
+    "X-token": "at-5555666677778888"
+   },
+   "hashKey": "aefb7a4f37990812e04aff8929c38288",
+   "secret": "e3ccc134f66ca217",
+   "queryEnc": "QWIzS2Q5TW5QcTJaE+DI10xYgr8mD5hMkVGaWPqJyDc5aqIyM4z+O+XemhFZhdWYQissaQ==",
+   "bodyEnc": "",
+   "sign": "32106e84437d6642bba7d7daa70f34859d8ce59000c5287eaadb78f8ee934b97"
+  },
+  {
+   "name": "POST 带 body",
+   "method": "POST",
+   "path": "/v1.1/m/thing/devid001/commands",
+   "refreshToken": "rt-1234123412341234",
+   "accessToken": "at-99990000aaaabbbb",
+   "params": null,
+   "body": {
+    "commands": [
+     {
+      "code": "switch_1",
+      "value": true
+     }
+    ]
+   },
+   "rid": "11112222-3333-4444-8555-666677778888",
+   "nonce": "Ab3Kd9MnPq2Z",
+   "headers": {
+    "X-appKey": "HA_3y9q4ak7g4ephrvke",
+    "X-requestId": "11112222-3333-4444-8555-666677778888",
+    "X-sid": "",
+    "X-time": "1758600000000",
+    "X-token": "at-99990000aaaabbbb"
+   },
+   "hashKey": "ee42ce3a34bbc9f66ee91bebfc185721",
+   "secret": "dd6670d8757b24bd",
+   "queryEnc": "",
+   "bodyEnc": "QWIzS2Q5TW5QcTJaacuEzvhYypQ5SzOhOroQ6YlCBA0/vGSYH/FMWsAF8Mr8g4rH1pYYuevbJBsq66akSWbfV9WbSD0GyNWJyuZi",
+   "sign": "a95ec34928e2682f72053bcd5812d5560cdc40a305184dd00368357f490965e3"
+  },
+  {
+   "name": "无 access_token（刷新令牌那一步）",
+   "method": "GET",
+   "path": "/v1.0/m/token/rt-abcdefabcdefabcd",
+   "refreshToken": "rt-abcdefabcdefabcd",
+   "accessToken": "",
+   "params": null,
+   "body": null,
+   "rid": "11112222-3333-4444-8555-666677778888",
+   "nonce": "Ab3Kd9MnPq2Z",
+   "headers": {
+    "X-appKey": "HA_3y9q4ak7g4ephrvke",
+    "X-requestId": "11112222-3333-4444-8555-666677778888",
+    "X-sid": "",
+    "X-time": "1758600000000"
+   },
+   "hashKey": "be480c84e39acd5b58519f0a05957373",
+   "secret": "66638cc4b43ef6d5",
+   "queryEnc": "",
+   "bodyEnc": "",
+   "sign": "72621b6f93c3c9286e0922e795fafb68088bf31a4afaece56e4d061a6483873a"
+  },
+  {
+   "name": "中文与转义字符",
+   "method": "GET",
+   "path": "/v1.0/m/life/ha/devices/detail",
+   "refreshToken": "rt-中文也要能签",
+   "accessToken": "at-x",
+   "params": {
+    "devIds": "a,b",
+    "note": "引号\"与反斜杠\\还有换行\n"
+   },
+   "body": null,
+   "rid": "11112222-3333-4444-8555-666677778888",
+   "nonce": "Ab3Kd9MnPq2Z",
+   "headers": {
+    "X-appKey": "HA_3y9q4ak7g4ephrvke",
+    "X-requestId": "11112222-3333-4444-8555-666677778888",
+    "X-sid": "",
+    "X-time": "1758600000000",
+    "X-token": "at-x"
+   },
+   "hashKey": "7ed18e5ed077a25d9362fd89edb1b9a0",
+   "secret": "8cad3ced06d98742",
+   "queryEnc": "QWIzS2Q5TW5QcTJaQPLzbVxdCOgwsUzumHAi5q75klMTWPoqSgsQcJ2IzaydyOzl58M1SX8UP9e5BLcZu9ia5I+e98K8wopj/p4CKeUAxDMqA26XLf+ePd4pYyJQXDpdAtEabSD4M76YzversaJRjshQyYqKUoPg",
+   "bodyEnc": "",
+   "sign": "b7288585afc5feb1ff4cce65e93ec38fbe91e0d47e117975f335b1fcb8a56757"
+  }
+ ],
+ "qrRequests": [
+  {
+   "method": "POST",
+   "url": "https://apigw.iotbing.com/v1.0/m/life/home-assistant/qrcode/tokens?clientid=HA_3y9q4ak7g4ephrvke&usercode=usercode-01&schema=haauthorize"
+  },
+  {
+   "method": "GET",
+   "url": "https://apigw.iotbing.com/v1.0/m/life/home-assistant/qrcode/tokens/QRTOKEN-abc123?clientid=HA_3y9q4ak7g4ephrvke&usercode=usercode-01"
+  }
+ ],
+ "appKey": "HA_3y9q4ak7g4ephrvke",
+ "schema": "haauthorize"
+}
